@@ -1,0 +1,95 @@
+networks:
+  mgmt-net:
+    driver: bridge
+  # Mạng CA tách riêng khỏi mgmt-net — chỉ orchestrator được nối cả 2 mạng.
+  # Web/Keycloak KHÔNG nằm trên ca-net, đúng nguyên tắc 4.1 trong docs/architecture-proposal.md.
+  ca-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  keycloak-data:
+  step-ca-data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_AUDIT_USER: ${POSTGRES_AUDIT_USER}
+      POSTGRES_AUDIT_PASSWORD: ${POSTGRES_AUDIT_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    networks: [mgmt-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    restart: unless-stopped
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+    volumes:
+      - keycloak-data:/opt/keycloak/data
+      - ./infra/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    ports:
+      - "8080:8080"
+    networks: [mgmt-net]
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  # CA/Secrets cluster — cố ý đặt trên network riêng (ca-net), không public port,
+  # không có route trực tiếp từ web/Keycloak. Chỉ orchestrator (control-plane) được gọi.
+  step-ca:
+    image: smallstep/step-ca:latest
+    restart: unless-stopped
+    environment:
+      DOCKER_STEPCA_INIT_NAME: ${STEPCA_NAME}
+      DOCKER_STEPCA_INIT_DNS_NAMES: ${STEPCA_DNS_NAMES}
+      DOCKER_STEPCA_INIT_PROVISIONER_NAME: orchestrator
+      DOCKER_STEPCA_INIT_PASSWORD: ${STEPCA_PROVISIONER_PASSWORD}
+      DOCKER_STEPCA_INIT_SSH: "true"
+    volumes:
+      - step-ca-data:/home/step
+    networks: [ca-net]
+    healthcheck:
+      test: ["CMD", "step", "ca", "health", "--ca-url", "https://localhost:9000", "--root", "/home/step/certs/root_ca.crt"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  orchestrator:
+    build: ./apps/orchestrator
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      AUDIT_DATABASE_URL: postgresql+psycopg://${POSTGRES_AUDIT_USER}:${POSTGRES_AUDIT_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      KEYCLOAK_ISSUER_URL: ${KEYCLOAK_ISSUER_URL}
+      # Hostname nội bộ trong docker network — orchestrator dùng để tự fetch
+      # JWKS, tách biệt với KEYCLOAK_ISSUER_URL (URL công khai cho browser, vd
+      # "localhost:8080") mà container không tự resolve tới được. Xem app/config.py.
+      KEYCLOAK_INTERNAL_URL: http://keycloak:8080/realms/hardening-console
+      SECRET_KEY: ${ORCHESTRATOR_SECRET_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      step-ca:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    # Orchestrator là thành phần DUY NHẤT nối cả mgmt-net lẫn ca-net (mục 4.1).
+    networks: [mgmt-net, ca-net]

@@ -1,0 +1,64 @@
+{
+  "realm": "hardening-console",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "bruteForceProtected": true,
+  "failureFactor": 5,
+  "otpPolicyType": "totp",
+  "otpPolicyAlgorithm": "HmacSHA1",
+  "otpPolicyDigits": 6,
+  "otpPolicyPeriod": 30,
+  "requiredActions": [
+    {
+      "alias": "CONFIGURE_TOTP",
+      "name": "Configure OTP",
+      "providerId": "CONFIGURE_TOTP",
+      "enabled": true,
+      "defaultAction": true,
+      "priority": 10,
+      "config": {}
+    }
+  ],
+  "roles": {
+    "realm": [
+      { "name": "viewer", "description": "Chỉ xem điểm compliance" },
+      { "name": "auditor", "description": "Xem toàn bộ audit log, không sửa" },
+      { "name": "rule-editor", "description": "Soạn/đề xuất control, không tự deploy" },
+      { "name": "approver", "description": "Duyệt thay đổi, không tự thực thi" },
+      { "name": "operator", "description": "Thực thi sau khi được duyệt" },
+      { "name": "admin", "description": "Quản trị hệ thống — KHÔNG được tự phê duyệt thay đổi của chính mình (ràng buộc phải enforce ở tầng ứng dụng, Keycloak không tự kiểm tra được điều này)" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "orchestrator",
+      "name": "Hardening Console Orchestrator",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["http://localhost:8000/*"],
+      "webOrigins": ["+"],
+      "defaultClientScopes": ["profile", "email", "roles"]
+    },
+    {
+      "clientId": "web",
+      "name": "Hardening Console Web UI",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["http://localhost:3000/*", "http://172.30.2.111:3000/*"],
+      "webOrigins": ["http://localhost:3000", "http://172.30.2.111:3000"],
+      "defaultClientScopes": ["profile", "email", "roles"]
+    }
+  ]
+}

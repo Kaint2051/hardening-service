@@ -1,0 +1,39 @@
+# Secrets — never commit
+.env
+*.pem
+*.key
+!infra/step-ca/**/*.example
+infra/step-ca/data/
+infra/step-ca/certs/
+infra/keycloak/data/
+scripts/content-signing/staging/*
+scripts/content-signing/reviewed/*
+scripts/content-signing/signed/*
+!scripts/content-signing/*/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local session state
+.claude/
+
+# Docker
+postgres-data/
+
+# Ansible — inventory thật và key export không commit
+ansible/inventory/hosts.ini
+ansible/files/*
+!ansible/files/.gitkeep

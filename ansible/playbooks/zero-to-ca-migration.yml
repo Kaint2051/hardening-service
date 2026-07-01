@@ -1,0 +1,99 @@
+---
+# Zero-to-CA Migration playbook (mục 4.4 trong docs/architecture-proposal.md)
+#
+# Mục tiêu: đưa các máy hiện hữu (đang dùng static SSH key/password) sang tin
+# cậy SSH Certificate Authority (step-ca), theo batch nhỏ + canary, và CHỈ
+# thu hồi credential cũ trên một máy SAU KHI đã xác nhận máy đó truy cập được
+# bằng cert mới — không bao giờ xoá đường lui trước khi có đường mới hoạt động.
+#
+# Đây là "cửa sổ rủi ro lớn nhất vòng đời hệ thống" (mục 4.4/rủi ro #8) — chạy
+# playbook này với `--limit` một nhóm nhỏ trước, xác nhận ổn định rồi mới mở
+# rộng dần. KHÔNG chạy một lần cho toàn bộ fleet.
+#
+# Dùng (ví dụ canary 2 máy đầu tiên trước):
+#   ansible-playbook -i inventory/hosts.ini playbooks/zero-to-ca-migration.yml \
+#     --limit batch1 --ask-pass  # hoặc --private-key <key cũ>
+
+- name: Zero-to-CA Migration
+  hosts: all
+  become: true
+  serial: 1                 # xử lý TỪNG máy một — canary thật sự, không song song hàng loạt
+  max_fail_percentage: 0    # 1 máy lỗi là dừng ngay, không tiếp tục sang máy khác trong batch
+
+  vars:
+    ca_ssh_user_pubkey_path: "{{ playbook_dir }}/../files/ssh_user_ca.pub"  # export từ step-ca, xem infra/step-ca/README.md
+    orchestrator_audit_url: "http://localhost:8000/internal/audit-events"
+    sshd_ca_trust_file: /etc/ssh/user_ca.pub
+    # Tên unit systemd của sshd khác nhau giữa các distro: Debian/Ubuntu dùng
+    # "ssh", RHEL/CentOS/Rocky dùng "sshd". Cho phép override qua -e nếu cần.
+    sshd_service_name: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
+
+  tasks:
+    - name: Kiểm tra file public key của SSH User CA tồn tại trên control node
+      ansible.builtin.stat:
+        path: "{{ ca_ssh_user_pubkey_path }}"
+      register: ca_pubkey_stat
+      delegate_to: localhost
+      run_once: true
+
+    - name: Dừng nếu chưa export public key của SSH User CA
+      ansible.builtin.fail:
+        msg: >
+          Chưa có {{ ca_ssh_user_pubkey_path }}. Export bằng:
+          `docker compose exec step-ca step ssh config --roots` rồi lưu phần
+          User CA public key vào đường dẫn trên trước khi chạy playbook này.
+      when: not ca_pubkey_stat.stat.exists
+      delegate_to: localhost
+      run_once: true
+
+    - name: 1. Đẩy public key của SSH User CA lên máy đích
+      ansible.builtin.copy:
+        src: "{{ ca_ssh_user_pubkey_path }}"
+        dest: "{{ sshd_ca_trust_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+      register: ca_pubkey_deployed
+
+    - name: 2. Bật TrustedUserCAKeys trong sshd_config (CHƯA reload sshd)
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?TrustedUserCAKeys\s'
+        line: "TrustedUserCAKeys {{ sshd_ca_trust_file }}"
+        validate: /usr/sbin/sshd -t -f %s
+      register: sshd_config_updated
+
+    - name: 3. Reload sshd (áp dụng TrustedUserCAKeys — sshd_config đã validate ở bước trên)
+      ansible.builtin.service:
+        name: "{{ sshd_service_name }}"
+        state: reloaded
+      when: sshd_config_updated.changed
+
+    # --- Điểm quan trọng nhất của playbook: KHÔNG thu hồi credential cũ ở
+    # đây. Việc verify "cert mới thật sự dùng được" và "thu hồi credential cũ"
+    # phải là một hành động RIÊNG, có xác nhận rõ ràng, chạy sau khi Orchestrator
+    # (không phải playbook này) đã tự cấp thử 1 SSH cert ngắn hạn và kết nối
+    # thành công tới máy này. Xem ansible/README.md mục "Bước 2: chốt migration".
+    - name: 4. Ghi nhận máy đã sẵn sàng nhận cert (CHƯA migrate hoàn tất)
+      ansible.builtin.uri:
+        url: "{{ orchestrator_audit_url }}"
+        method: POST
+        body_format: json
+        body:
+          actor: "zero-to-ca-migration-playbook"
+          action: "ca_trust_deployed"
+          resource: "{{ inventory_hostname }}"
+          payload:
+            step: "trust_deployed_old_credential_still_active"
+        status_code: [200, 201]
+      delegate_to: localhost
+      failed_when: false   # không chặn migration nếu Orchestrator tạm thời chưa lên — nhưng nên retry thủ công sau
+
+    - name: In hướng dẫn bước tiếp theo
+      ansible.builtin.debug:
+        msg: >
+          {{ inventory_hostname }}: đã bật trust CA, CREDENTIAL CŨ VẪN CÒN
+          HOẠT ĐỘNG. Bước tiếp theo (thủ công/qua Orchestrator, KHÔNG phải
+          playbook này): cấp thử 1 SSH cert ngắn hạn, verify connect thành
+          công, rồi mới chạy playbook revoke-old-credential.yml cho riêng máy
+          này.

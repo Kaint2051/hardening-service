@@ -1,0 +1,17 @@
+# Pin theo commit hash CỤ THỂ (không dùng branch "main"/"master" di động) để
+# tránh supply-chain attack qua kênh cập nhật role cộng đồng (mục 4.2 và rủi ro
+# "Ansible Control Node..." trong architecture-proposal.md).
+#
+# ⚠️ CÁC GIÁ TRỊ "version" DƯỚI ĐÂY LÀ PLACEHOLDER — CHƯA ĐƯỢC REVIEW/GHIM.
+# Trước khi build image thật:
+#   1. Reviewer đọc toàn bộ diff của role tại commit dự kiến dùng.
+#   2. Ghi commit hash đầy đủ (40 ký tự) vào "version" bên dưới.
+#   3. Đi qua quy trình 3 vai trò trong scripts/content-signing/ trước khi
+#      coi image build ra là đáng tin để chạy trên production.
+roles:
+  - name: dev-sec.os-hardening
+    src: https://github.com/dev-sec/ansible-os-hardening.git
+    version: "REPLACE_WITH_REVIEWED_COMMIT_SHA"
+  - name: dev-sec.ssh-hardening
+    src: https://github.com/dev-sec/ansible-ssh-hardening.git
+    version: "REPLACE_WITH_REVIEWED_COMMIT_SHA"
