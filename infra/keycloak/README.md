@@ -31,6 +31,19 @@
 3. **`start-dev` chỉ dùng cho local/dev** — production cần `start` với TLS
    thật, DB Postgres riêng cho Keycloak (không dùng H2 mặc định), và review
    lại `bruteForceProtected`/session timeout theo policy tổ chức.
+   - **`sslRequired` đang để `"none"`** (trước đây là `"external"` — mặc định
+     của Keycloak, chặn mọi request không phải HTTPS trừ khi đến từ
+     localhost). Phát hiện qua test thật: mọi lần verify trước đó đều chạy
+     qua SSH `docker compose exec ... curl http://localhost:8080/...`
+     (Keycloak coi là "nội bộ" nên không bị chặn), nên gap này không lộ ra
+     cho tới khi có người dùng trình duyệt thật kết nối tới
+     `http://172.30.2.111:8080` (network path "external" thật sự) — Keycloak
+     trả `403 {"error":"invalid_request","error_description":"HTTPS
+     required"}`, khiến SPA không bao giờ redirect được sang trang login.
+     Đã đổi `sslRequired` về `"none"` (chấp nhận được ở dev/lab vì TOÀN BỘ hệ
+     thống — web, API, Keycloak — hiện chưa có TLS ở đâu cả). **Bắt buộc đổi
+     lại `"external"` (hoặc `"all"`) khi có TLS thật trước production** —
+     nếu không, mật khẩu/token sẽ đi qua mạng dưới dạng plaintext.
 4. Nếu VNNIC có LDAP/AD nội bộ, cấu hình User Federation trỏ tới đó thay vì
    tạo user cục bộ trong Keycloak (việc này thuộc Giai đoạn 3 theo roadmap,
    nhưng có thể làm sớm hơn nếu LDAP đã sẵn sàng).

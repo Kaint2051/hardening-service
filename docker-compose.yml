@@ -5,15 +5,39 @@ networks:
   # Web/Keycloak KHÔNG nằm trên ca-net, đúng nguyên tắc 4.1 trong docs/architecture-proposal.md.
   ca-net:
     driver: bridge
+  # Mạng nội bộ cho job execution — CHỈ orchestrator + job-dispatcher nối vào.
+  # job-dispatcher là service DUY NHẤT giữ quyền Docker (mount docker.sock) —
+  # xem apps/job-dispatcher/README.md để hiểu vì sao tách riêng khỏi orchestrator.
+  job-net:
+    driver: bridge
+  # Mạng cho Agent Manager (mục 4.3) — KHÔNG nối ca-net (chỉ Orchestrator
+  # được gọi CA). Agent thật (chạy trên các máy khác trong fleet, ngoài
+  # docker network này) kết nối qua port publish của agent-manager, không
+  # qua network Docker này — xem apps/agent-manager/README.md.
+  agent-net:
+    driver: bridge
 
 volumes:
   postgres-data:
+  # Repo backup pgBackRest (Giai đoạn 3 Phase 1/7 — xem
+  # infra/postgres/README.md) — TẠM cùng VM/Docker daemon với postgres-data
+  # (chấp nhận được ở quy mô 1 VM hiện tại, KHÔNG bảo vệ được mất cả VM; di
+  # dời sang VM/host khác ở Phase 3-4 chỉ cần đổi repo1-path/repo1-host
+  # trong infra/postgres/pgbackrest.conf, không đổi gì ở service postgres).
+  pgbackrest-repo:
+  # Volume RIÊNG cho container restore-drill (profile "restore-drill") —
+  # KHÔNG BAO GIỜ đụng tới postgres-data thật, xoá sạch sau mỗi lần rehearsal
+  # (xem infra/postgres/restore-drill.sh).
+  postgres-restore-drill-data:
   keycloak-data:
   step-ca-data:
 
 services:
   postgres:
-    image: postgres:16-alpine
+    # Image build riêng (infra/postgres/Dockerfile) — postgres:16-alpine +
+    # pgBackRest cài thêm layer, chạy cùng filesystem PGDATA để
+    # archive_command gọi trực tiếp (xem infra/postgres/README.md).
+    build: ./infra/postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
@@ -21,8 +45,32 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_AUDIT_USER: ${POSTGRES_AUDIT_USER}
       POSTGRES_AUDIT_PASSWORD: ${POSTGRES_AUDIT_PASSWORD}
+      # pgBackRest tự đọc override qua biến môi trường PGBACKREST_* (không
+      # cần sửa pgbackrest.conf/archive_command) — role superuser thật của
+      # cluster này là POSTGRES_USER (image chính thức KHÔNG tạo thêm role
+      # "postgres" riêng khi POSTGRES_USER khác "postgres"), pgbackrest mặc
+      # định lại thử kết nối bằng role "postgres" — phải khai rõ, nếu không
+      # stanza-create/backup báo lỗi "role postgres does not exist".
+      PGBACKREST_PG1_USER: ${POSTGRES_USER}
+    # archive_mode/archive_command bật WAL archiving liên tục qua pgBackRest
+    # (PITR giữa 2 lần full backup, không chỉ khôi phục về đúng lúc backup
+    # gần nhất) — wal_level=replica cũng là điều kiện bắt buộc cho Phase 5
+    # (streaming replication) sau này, bật luôn từ đây để khỏi phải đổi lại.
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=pgbackrest --stanza=hardening-console archive-push %p
+      - -c
+      - max_wal_senders=3
+      - -c
+      - archive_timeout=60
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - pgbackrest-repo:/var/lib/pgbackrest
       - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
     networks: [mgmt-net]
     healthcheck:
@@ -30,6 +78,32 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # Container tạm dùng CHỈ để rehearsal/verify restore PITR (KHÔNG chạy
+  # thường trực — profile "restore-drill", đứng ngoài `docker compose up`
+  # mặc định). Đọc-chỉ repo pgBackRest thật, phục hồi vào volume RIÊNG
+  # (postgres-restore-drill-data, không phải postgres-data thật) — xem
+  # infra/postgres/restore-drill.sh và infra/postgres/README.md.
+  postgres-restore-drill:
+    build: ./infra/postgres
+    profiles: ["restore-drill"]
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        chown -R postgres:postgres /var/lib/postgresql/data
+        su postgres -c 'pgbackrest --stanza=hardening-console --delta restore'
+        exec docker-entrypoint-wrapper.sh postgres
+    volumes:
+      - postgres-restore-drill-data:/var/lib/postgresql/data
+      - pgbackrest-repo:/var/lib/pgbackrest:ro
+    networks: [mgmt-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   keycloak:
     image: quay.io/keycloak/keycloak:24.0
@@ -77,11 +151,44 @@ services:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       AUDIT_DATABASE_URL: postgresql+psycopg://${POSTGRES_AUDIT_USER}:${POSTGRES_AUDIT_PASSWORD}@postgres:5432/${POSTGRES_DB}
       KEYCLOAK_ISSUER_URL: ${KEYCLOAK_ISSUER_URL}
+      WEB_ORIGIN: ${WEB_ORIGIN}
       # Hostname nội bộ trong docker network — orchestrator dùng để tự fetch
       # JWKS, tách biệt với KEYCLOAK_ISSUER_URL (URL công khai cho browser, vd
       # "localhost:8080") mà container không tự resolve tới được. Xem app/config.py.
       KEYCLOAK_INTERNAL_URL: http://keycloak:8080/realms/hardening-console
       SECRET_KEY: ${ORCHESTRATOR_SECRET_KEY}
+      STEPCA_PROVISIONER_PASSWORD: ${STEPCA_PROVISIONER_PASSWORD}
+      JOB_DISPATCHER_URL: https://job-dispatcher:9100
+      JOB_DISPATCHER_SHARED_SECRET: ${JOB_DISPATCHER_SHARED_SECRET}
+      # Agent Manager (mục 4.3, chưa triển khai service Go thật trong pass
+      # này) sẽ gọi vào /internal/agent/* bằng secret này — cùng pattern
+      # JOB_DISPATCHER_SHARED_SECRET.
+      AGENT_MANAGER_SHARED_SECRET: ${AGENT_MANAGER_SHARED_SECRET}
+      # execution-env's remediate.sh dùng fingerprint này để verify chữ ký
+      # bundle remediation trước khi chạy ansible-playbook — xem app/jobs.py
+      # và scripts/content-signing/README.md.
+      CONTENT_SIGNING_TRUSTED_FINGERPRINT: ${CONTENT_SIGNING_TRUSTED_FINGERPRINT}
+      # step ssh certificate --ca-url bắt buộc phải verify root cert (không có
+      # cờ nào bỏ qua bước này, đã verify thật — step-cli từ chối chạy nếu
+      # thiếu --root/--token). Root cert KHÔNG phải bí mật (chỉ root KEY mới
+      # là bí mật) nên mount read-only step-ca-data để lấy đúng file
+      # certs/root_ca.crt — đơn giản hơn là dựng thêm kênh phân phối riêng.
+      STEPCA_ROOT_CERT_PATH: /stepca-root/certs/root_ca.crt
+      # Active Response (mục "Agent thực thi remediation thật", xem
+      # app/jobs.py:_dispatch_remediate_job) — kill-switch TOÀN CỤC, mặc định
+      # false. CONTENT_SIGNING_SIGNED_DIR không cần khai báo riêng — mặc định
+      # Settings đã là "/content-signed", khớp đúng đường dẫn mount read-only
+      # bên dưới.
+      ACTIVE_RESPONSE_ENABLED: ${ACTIVE_RESPONSE_ENABLED}
+    volumes:
+      - step-ca-data:/stepca-root:ro
+      # Đọc TRỰC TIẾP content.tar.gz + .sig đã ký để trả cho Agent qua
+      # POST /internal/agent/remediation-bundle (app/agents.py) — dùng CHUNG
+      # biến host-path với job-dispatcher (CONTENT_SIGNING_SIGNED_HOST_PATH)
+      # vì cùng 1 thư mục vật lý trên host, nhưng đây là mount TRỰC TIẾP vào
+      # container Orchestrator (khác cơ chế Docker-outside-of-Docker mà
+      # job-dispatcher dùng cho execution-env sibling container).
+      - ${CONTENT_SIGNING_SIGNED_HOST_PATH}:/content-signed:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -89,7 +196,74 @@ services:
         condition: service_healthy
       step-ca:
         condition: service_healthy
+      # KHÔNG phụ thuộc job-dispatcher — bỏ đi (trước đây có nhưng không có
+      # lý do thực sự: Orchestrator chỉ gọi job-dispatcher LAZY khi có job
+      # thật, không cần nó start trước). Giờ QUAN HỆ NGƯỢC LẠI mới đúng thực
+      # tế: job-dispatcher cần Orchestrator chạy để xin server cert mTLS lúc
+      # khởi động (xem service job-dispatcher bên dưới) — giữ cả 2 chiều sẽ
+      # tạo circular dependency, Docker Compose từ chối khởi động.
     ports:
       - "8000:8000"
-    # Orchestrator là thành phần DUY NHẤT nối cả mgmt-net lẫn ca-net (mục 4.1).
-    networks: [mgmt-net, ca-net]
+    # Orchestrator nối mgmt-net + ca-net (mục 4.1, để tự cấp SSH cert ngắn hạn
+    # cho job) + job-net (gọi job-dispatcher) — nhưng KHÔNG có quyền Docker
+    # trực tiếp, xem apps/job-dispatcher/README.md.
+    networks: [mgmt-net, ca-net, job-net]
+
+  # Service DUY NHẤT giữ quyền Docker (mount docker.sock) — xem README.md
+  # cùng thư mục để hiểu vì sao tách riêng khỏi Orchestrator. KHÔNG public
+  # port, chỉ nhận lệnh từ Orchestrator qua job-net.
+  job-dispatcher:
+    build: ./apps/job-dispatcher
+    restart: unless-stopped
+    environment:
+      JOB_DISPATCHER_SHARED_SECRET: ${JOB_DISPATCHER_SHARED_SECRET}
+      ALLOWED_EXECUTION_IMAGE: hardening-console-execution-env:latest
+      # Đường dẫn TRÊN HOST DOCKER thật (Docker-outside-of-Docker: bind-mount
+      # cho container sibling phải theo đường dẫn host, KHÔNG phải đường dẫn
+      # bên trong chính container job-dispatcher) — xem app/main.py.
+      CONTENT_SIGNING_SIGNED_HOST_PATH: ${CONTENT_SIGNING_SIGNED_HOST_PATH}
+      # job-dispatcher không nối ca-net — xin cert server mTLS của chính nó
+      # qua Orchestrator (POST /internal/job-dispatcher/server-cert), tự
+      # renew định kỳ, cùng pattern agent-manager. Xem app/serve.py.
+      ORCHESTRATOR_URL: http://orchestrator:8000
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      orchestrator:
+        condition: service_started
+    networks: [job-net]
+
+  # Agent Manager (mục 4.3) — relay mTLS cho Agent tự phát triển. KHÔNG nối
+  # ca-net (chỉ Orchestrator được gọi CA) — kể cả cert server của chính nó
+  # cũng xin qua Orchestrator (POST /internal/agent-manager/server-cert), xem
+  # apps/agent-manager/README.md.
+  agent-manager:
+    build: ./apps/agent-manager
+    restart: unless-stopped
+    environment:
+      ORCHESTRATOR_URL: http://orchestrator:8000
+      AGENT_MANAGER_SHARED_SECRET: ${AGENT_MANAGER_SHARED_SECRET}
+    depends_on:
+      orchestrator:
+        condition: service_started
+    # Publish ra host vì agent thật chạy trên các máy KHÁC trong fleet, cần
+    # với tới qua mạng LAN — khác step-ca (cố tình không publish).
+    ports:
+      - "8443:8443"
+    networks: [agent-net, mgmt-net]
+
+  # SPA React tĩnh, serve bằng nginx — không có logic nghiệp vụ, chỉ gọi
+  # Orchestrator API. Cùng mgmt-net với Keycloak (mục 4.1: web/Keycloak không
+  # nằm trên ca-net) — xem apps/web/README.md.
+  web:
+    build:
+      context: ./apps/web
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL}
+        VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL}
+        VITE_KEYCLOAK_REALM: ${VITE_KEYCLOAK_REALM}
+        VITE_KEYCLOAK_CLIENT_ID: ${VITE_KEYCLOAK_CLIENT_ID}
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    networks: [mgmt-net]

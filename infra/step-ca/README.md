@@ -14,7 +14,9 @@ cả root lẫn intermediate trong cùng container để tiện phát triển lo
 **Trước khi đưa vào môi trường thật:**
 1. Sinh root CA trên máy air-gapped (không nối mạng), export intermediate CSR,
    ký bằng root, rồi disable/tháo máy root khỏi mạng — root private key không
-   bao giờ được nằm trên máy có kết nối mạng.
+   bao giờ được nằm trên máy có kết nối mạng. Quy trình chi tiết + script đã
+   chuẩn bị sẵn và diễn tập thật (xem README.md gốc mục tương ứng): xem
+   [`root-ca-airgap-runbook.md`](root-ca-airgap-runbook.md).
 2. Chỉ intermediate CA (đã ký bởi root) mới chạy online trong container này.
 3. Đặt container này trên `ca-net` cô lập như đã cấu hình sẵn — không thêm
    port publish, không nối thêm service nào khác ngoài `orchestrator`.

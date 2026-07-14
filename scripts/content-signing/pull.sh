@@ -8,6 +8,14 @@ set -euo pipefail
 
 SOURCE_URL="${1:?thiếu source_url}"
 NAME="${2:?thiếu name (vd: complianceascode-v0.1.73)}"
+# Chặn "/", ".." và ký tự đặc biệt khác — NAME ghép thẳng vào đường dẫn
+# thư mục staging/ bên dưới, không chặn thì 1 NAME kiểu "../../etc/cron.d/x"
+# có thể ghi ra ngoài staging/ (path traversal), và ký tự `"` lọt vào
+# manifest.json (ghi bằi heredoc, không escape) sẽ làm hỏng cấu trúc JSON.
+if [[ ! "$NAME" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    echo "LỖI: name chỉ được chứa chữ/số/dấu chấm/gạch ngang/gạch dưới (nhận: '${NAME}')" >&2
+    exit 1
+fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 DIR="${ROOT_DIR}/staging/${NAME}-${STAMP}"

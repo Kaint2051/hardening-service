@@ -42,7 +42,9 @@ if [[ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]]; then
 fi
 
 echo "==> Tất cả kiểm tra pass (3 fingerprint khác nhau, sha256 khớp). Ký bundle cuối cùng."
-gpg --detach-sign --armor --output "${REVIEWED_DIR}/content.tar.gz.sig" "${REVIEWED_DIR}/content.tar.gz"
+# --local-user "$SIGNER_FPR": pin đúng key đã kiểm tra "khác Puller/Reviewer"
+# ở trên cho lệnh ký thật — xem giải thích chi tiết trong review.sh.
+gpg --local-user "$SIGNER_FPR" --detach-sign --armor --output "${REVIEWED_DIR}/content.tar.gz.sig" "${REVIEWED_DIR}/content.tar.gz"
 
 cat > "${REVIEWED_DIR}/signing-record.json" <<EOF
 {

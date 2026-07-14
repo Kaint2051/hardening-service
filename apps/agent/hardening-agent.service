@@ -1,0 +1,70 @@
+# systemd unit cho Reporter (mục 4.3 docs/architecture-proposal.md).
+#
+# TRƯỚC KHI cài unit này: chạy ./provision.sh 1 lần (tạo user/group hệ
+# thống + /etc/hardening-agent) — xem README.md.
+#
+# Cài đặt (đường dẫn ví dụ, đổi lại nếu deploy vào chỗ khác):
+#   scp agent <host>:/opt/hardening-agent/agent
+#   scp hardening-agent.service <host>:/etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now hardening-agent.service
+#
+# AGENT_STATE_DIR giữ nguyên /etc/hardening-agent (KHÔNG dùng
+# StateDirectory= của systemd — directive đó chỉ quản lý path dưới
+# /var/lib, không áp dụng cho /etc). Thư mục này phải được provision.sh tạo
+# sẵn với owner đúng TRƯỚC khi unit này chạy lần đầu, vì Reporter cần ghi
+# vào đây ngay từ lần enroll đầu tiên (agent.crt/agent.key/ca-root.crt).
+[Unit]
+Description=Hardening Agent (Reporter) - heartbeat, scan OpenSCAP, FIM, Active Response
+# Xem apps/agent/README.md trong repo để biết chi tiết cấu hình/triển khai
+# (Documentation= của systemd chỉ chấp nhận URI hợp lệ, không chấp nhận mô
+# tả dạng văn bản tự do — bỏ hẳn field này thay vì đặt 1 giá trị vô nghĩa).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hardening-agent
+Group=hardening-agent
+Environment=AGENT_STATE_DIR=/etc/hardening-agent
+# Dấu "-" đầu đường dẫn: không lỗi nếu file chưa tồn tại (mặc định
+# AGENT_MANAGER_URL=https://localhost:8443 dùng được khi Agent Manager chạy
+# CÙNG máy, chỉ hợp cho test/dev). Triển khai thật (Agent Manager ở máy
+# khác) PHẢI tạo file này với ít nhất AGENT_MANAGER_URL/AGENT_HOSTNAME — xem
+# README.md mục "Triển khai qua systemd".
+EnvironmentFile=-/etc/hardening-agent/agent.env
+ExecStart=/opt/hardening-agent/agent
+Restart=on-failure
+RestartSec=5s
+
+# --- Hardening ---
+# ProtectSystem=strict biến toàn bộ / (kể cả /etc) thành read-only trong
+# mount namespace riêng của tiến trình này — phải khai báo ReadWritePaths
+# rõ ràng cho đúng 1 thư mục Reporter thực sự cần ghi (enroll lần đầu +
+# renew cert sau này), thay vì nới lỏng xuống ProtectSystem=full.
+ReadWritePaths=/etc/hardening-agent
+# CacheDirectory= là cơ chế chuẩn của systemd để có 1 thư mục ghi được dưới
+# /var/cache mà KHÔNG cần nới ProtectSystem — tự tạo + chown
+# /var/cache/hardening-agent (User=/Group= ở trên) MỖI LẦN start, khớp
+# AGENT_CONTENT_CACHE_DIR mặc định (xem README.md mục "Active Response").
+# Mode 0770: Reporter (chủ sở hữu) ghi được, group hardening-agent (Executor
+# là thành viên, xem provision.sh) đọc được, user khác trên máy thì không.
+CacheDirectory=hardening-agent
+CacheDirectoryMode=0770
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

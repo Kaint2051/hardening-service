@@ -1,0 +1,78 @@
+# systemd unit cho Executor — Active Response ĐÃ BẬT, tiến trình chạy ROOT
+# HOÀN TOÀN (xem README.md cùng thư mục mục "Chạy quyền root"). Quyết định
+# đã chốt: KHÔNG dùng capability set thu hẹp vì nội dung remediation là 1
+# playbook Ansible tuỳ ý trong bundle đã ký — phạm vi hành động không cố định
+# trước (có thể đổi bất kỳ file/service/sysctl nào trên máy), nên không có
+# capability set cố định nào "đủ mà không thừa"; verify chữ ký GPG (mục
+# "TRƯỚC khi chạy" trong README) là lớp kiểm soát chính, không phải giới hạn
+# quyền hệ điều hành của chính Executor.
+#
+# TRƯỚC KHI cài unit này: chạy ../provision.sh 1 lần (tạo user/group hệ
+# thống, thư mục cache bundle) — xem README.md. ansible-core PHẢI đã cài trên
+# máy đích (Executor tự kiểm tra `exec.LookPath` lúc khởi động, Fatal rõ ràng
+# nếu thiếu).
+#
+# Cài đặt (đường dẫn ví dụ, đổi lại nếu deploy vào chỗ khác):
+#   scp executor <host>:/opt/hardening-agent/executor/executor
+#   scp hardening-executor.service <host>:/etc/systemd/system/
+#   # tạo /etc/hardening-agent/executor.env (KHÔNG commit vào git) với ít
+#   # nhất: EXECUTOR_TRUSTED_SIGNER_FINGERPRINT=<fingerprint GPG tin cậy>
+#   systemctl daemon-reload
+#   systemctl enable --now hardening-executor.service
+[Unit]
+Description=Hardening Agent Executor (Active Response - chay quyen root)
+# Xem apps/agent/executor/README.md trong repo (Documentation= của systemd
+# chỉ chấp nhận URI hợp lệ, bỏ hẳn field này thay vì đặt giá trị vô nghĩa).
+
+[Service]
+Type=simple
+User=root
+# Group=hardening-agent (KHÔNG phải group riêng root) — để tiến trình tự
+# chown được file socket cho group hardening-agent (group Reporter thuộc về),
+# đúng nguyên tắc "member của group đích thì tự đổi group file mình sở hữu
+# được" — không cần thêm capability nào riêng cho việc này (đã chạy root).
+Group=hardening-agent
+# systemd tự tạo + chown /run/hardening-agent (User:Group ở trên) MỖI LẦN
+# start, khớp EXECUTOR_SOCKET_PATH mặc định — không cần provision.sh lo
+# thư mục này.
+RuntimeDirectory=hardening-agent
+# Đọc bởi systemd (root) TRƯỚC khi fork tiến trình Executor. File này KHÔNG
+# commit vào git (chứa fingerprint tin cậy, tách khỏi unit file
+# version-controlled).
+EnvironmentFile=/etc/hardening-agent/executor.env
+ExecStart=/opt/hardening-agent/executor/executor
+Restart=on-failure
+RestartSec=5s
+
+# --- Hardening còn GIỮ được dù chạy root (không mâu thuẫn với việc ghi
+# /etc/*, reload sysctl, khởi động lại service... mà remediation cần làm) ---
+# NoNewPrivileges=true: Executor (và mọi subprocess nó fork — gpg, tar,
+# ansible-playbook) không tự nâng quyền qua setuid/setgid/file capability
+# binary nào khác NGOÀI quyền root sẵn có của chính tiến trình — không cản
+# trở remediation hợp lệ (mọi thao tác root cần thiết đã có sẵn quyền root
+# trực tiếp, không cần "nâng thêm").
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+UMask=0077
+
+# --- ĐÃ GỠ (mâu thuẫn trực tiếp với remediation ghi /etc/*, reload
+# /proc/sys, và với việc đã root nên capability set không còn ý nghĩa) ---
+# ProtectSystem=strict, ProtectHome=true, ProtectKernelTunables=true:
+#   remediation PHẢI ghi được /etc/ssh, /etc/pam.d, /etc/sysctl.d... và có
+#   thể cần sysctl -w (ghi /proc/sys) — 3 directive này biến toàn bộ hệ
+#   thống file/kernel tunables thành read-only, chặn CHÍNH việc Executor
+#   được tạo ra để làm.
+# CapabilityBoundingSet=, AmbientCapabilities= (rỗng): vô nghĩa khi
+#   User=root — bounding set rỗng cho tiến trình root thực chất tương đương
+#   không có gì bị chặn thêm (root vẫn bỏ qua capability check ở nhiều
+#   syscall), giữ lại chỉ tạo cảm giác an toàn giả, không phải kiểm soát
+#   thật — bỏ hẳn cho rõ ràng thay vì gây hiểu nhầm.
+
+[Install]
+WantedBy=multi-user.target

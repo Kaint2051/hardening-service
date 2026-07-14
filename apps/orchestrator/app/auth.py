@@ -52,10 +52,25 @@ def get_current_user(
             detail=f"token không hợp lệ: {exc}",
         ) from exc
 
-    if claims.get("azp") != settings.keycloak_client_id:
+    if claims.get("azp") not in settings.keycloak_client_ids_set:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="token không được cấp cho client orchestrator",
+            detail="token không được cấp cho client hợp lệ (orchestrator/web)",
+        )
+
+    # Keycloak ID token và access token dùng chung issuer/azp, chỉ khác claim
+    # "typ" ("ID" vs "Bearer") — không kiểm tra riêng thì 1 ID token (vốn chỉ
+    # để xác thực đăng nhập ở SPA, KHÔNG phải để gọi API) vẫn qua được hết các
+    # bước verify ở trên. Phát hiện qua test thật: ID token gọi GET /me trả về
+    # 200 thay vì 401 (dù /me không cần role cụ thể nên impact hiện tại thấp
+    # — realm_access rỗng trong ID token của realm này nên các endpoint có
+    # require_roles() vẫn tự chặn — nhưng đây là anti-pattern OIDC đã biết,
+    # và bất kỳ endpoint mới nào chỉ cần get_current_user() mà không kèm
+    # require_roles() sẽ lập tức bị ảnh hưởng).
+    if claims.get("typ") != "Bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="token không phải access token hợp lệ",
         )
 
     roles = frozenset(claims.get("realm_access", {}).get("roles", []))

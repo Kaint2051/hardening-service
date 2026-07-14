@@ -44,6 +44,12 @@ if [[ "$CONFIRM" != "APPROVE" ]]; then
     exit 1
 fi
 
+# --local-user "$REVIEWER_FPR": pin đúng key ĐÃ kiểm tra ở trên (khác Puller)
+# cho lệnh ký thật — không truyền cờ này, gpg tự chọn key mặc định của máy,
+# có thể KHÁC key đã dùng để tính REVIEWER_FPR nếu keyring có nhiều secret
+# key (vd Reviewer lỡ import thêm key người khác) — khi đó check "khác
+# Puller" ở trên không còn phản ánh đúng key thực sự tạo ra chữ ký (phát
+# hiện qua review, không phải test thật).
 cat > "${STAGED_DIR}/review-record.json" <<EOF
 {
   "reviewed_by": "$(git config user.email 2>/dev/null || whoami)",
@@ -53,7 +59,7 @@ cat > "${STAGED_DIR}/review-record.json" <<EOF
   "decision": "APPROVE"
 }
 EOF
-gpg --clearsign --output "${STAGED_DIR}/review-record.json.asc" "${STAGED_DIR}/review-record.json"
+gpg --local-user "$REVIEWER_FPR" --clearsign --output "${STAGED_DIR}/review-record.json.asc" "${STAGED_DIR}/review-record.json"
 
 REVIEWED_DIR="${ROOT_DIR}/reviewed/$(basename "${STAGED_DIR}")"
 mv "${STAGED_DIR}" "${REVIEWED_DIR}"

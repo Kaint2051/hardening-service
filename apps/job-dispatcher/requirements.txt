@@ -1,0 +1,6 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+docker==7.1.0
+# Gọi Orchestrator xin/renew cert mTLS server của chính job-dispatcher (Giai
+# đoạn 2 — xem app/tls_identity.py) — cùng version Orchestrator đang dùng.
+httpx==0.27.2
