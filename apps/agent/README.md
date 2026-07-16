@@ -153,8 +153,18 @@ Thư mục cache (`AGENT_CONTENT_CACHE_DIR`) cần quyền ghi cho user Reporter
    (`AGENT_HOSTNAME` mặc định lấy theo `os.Hostname()` của máy — chỉ cần đặt
    tường minh nếu khác tên đã đăng ký, hoặc muốn cố định thay vì phụ thuộc
    cấu hình DNS/hostname hệ thống.)
-5. `systemctl daemon-reload && systemctl enable --now hardening-agent.service`
-   — log xem qua `journalctl -u hardening-agent -f`.
+
+   **Cả `POST .../agent-install` (tự động) và `.../agent-install-script` (dán
+   tay) đều TỰ ghi file này** nếu `settings.agent_manager_public_url` đã cấu
+   hình (`.env`) — chỉ cần tạo tay theo hướng dẫn trên nếu KHÔNG dùng 1 trong
+   2 endpoint này (vd chạy binary trần không qua script sinh sẵn). Thiếu biến
+   này, Agent "cài xong" (service chạy, không lỗi) nhưng KHÔNG BAO GIỜ enroll
+   được — lỗi âm thầm đã gặp thật (audit log có `agent_install_completed`
+   nhưng không có `agent_enrolled`), xem `app/config.py:agent_manager_public_url`.
+5. `systemctl daemon-reload && systemctl enable hardening-agent.service && systemctl restart hardening-agent.service`
+   — dùng `restart` (không chỉ `enable --now`) để chắc chắn áp dụng binary/
+   agent.env MỚI kể cả khi service đã chạy từ lần cài trước — log xem qua
+   `journalctl -u hardening-agent -f`.
 
 Unit chạy dưới user `hardening-agent` (không phải root), kèm bộ hardening
 directive chuẩn (`ProtectSystem=strict`, `NoNewPrivileges=true`,
@@ -165,6 +175,71 @@ từ lần enroll đầu tiên, và ghi lại mỗi lần renew cert sau này �
 chown `/var/cache/hardening-agent` mỗi lần start, khớp
 `AGENT_CONTENT_CACHE_DIR` mặc định — xem mục "Active Response" ở trên).
 `Restart=on-failure` (5s) tự khởi động lại nếu crash.
+
+## Remote-deploy tự động (đóng gói bundle cho `POST /hosts/{hostname}/agent-install`)
+
+Khác mục "Triển khai qua systemd" ở trên (operator tự SSH/scp/chạy tay, hoặc
+dán script gộp sẵn từ `POST /hosts/{hostname}/agent-install-script`),
+`POST /hosts/{hostname}/agent-install` (xem `app/agents.py:trigger_agent_install`)
+tự động hoá HOÀN TOÀN: Orchestrator tự SSH bằng cert ephemeral (host phải đã
+`trust_deployed`/`migrated`), tự scp binary + provision.sh + 2 systemd unit,
+tự chạy cài đặt — không cần operator thực thi gì trên máy đích.
+
+Đổi lại, binary `agent`/`executor` (và provision.sh + 2 unit file) phải được
+đóng gói thành **1 bundle đã ký** qua đúng quy trình 3 vai trò
+(`scripts/content-signing/README.md`), vì `apps/execution-env/agent-install.sh`
+verify chữ ký TRƯỚC khi đẩy bất cứ gì lên máy đích — không có ngoại lệ, cùng
+nguyên tắc `remediate.sh` áp dụng cho remediation content.
+
+### Đóng gói
+
+```bash
+./build.sh              # ra ./agent
+./executor/build.sh     # ra ./executor/executor (xem executor/README.md)
+
+mkdir -p /tmp/agent-bundle-payload
+cp agent executor/executor provision.sh hardening-agent.service \
+   executor/hardening-executor.service /tmp/agent-bundle-payload/
+tar czf /tmp/agent-bundle.tar.gz -C /tmp/agent-bundle-payload .
+```
+
+**Bundle PHẢI chứa đúng 5 file này ở gốc** (không nằm trong thư mục con) —
+`agent-install.sh` từ chối chạy nếu thiếu file nào sau khi giải nén:
+`agent`, `executor`, `provision.sh`, `hardening-agent.service`,
+`hardening-executor.service`.
+
+### Ký (quy trình 3 vai trò — 3 người, 3 GPG key khác nhau)
+
+```bash
+# Puller (có thể dùng file:// cho artifact build cục bộ, không chỉ URL công khai)
+scripts/content-signing/pull.sh "file:///tmp/agent-bundle.tar.gz" agent-v1
+
+# Reviewer (máy khác, GPG key khác)
+scripts/content-signing/review.sh staging/agent-v1-<timestamp>
+
+# Signer (máy khác, GPG key khác)
+scripts/content-signing/sign.sh reviewed/agent-v1-<timestamp>
+```
+
+Sau khi ký xong, set trong `.env` của Orchestrator:
+```
+AGENT_BUNDLE_REF=agent-v1-<timestamp>            # khớp đúng tên thư mục vừa tạo trong signed/
+AGENT_BUNDLE_TRUSTED_FINGERPRINT=<fingerprint của Signer>
+```
+`AGENT_BUNDLE_TRUSTED_FINGERPRINT` CỐ Ý tách riêng khỏi
+`CONTENT_SIGNING_TRUSTED_FINGERPRINT` (dùng cho remediation content) — đổi 1
+trong 2 không làm hỏng verify của bên còn lại (xem app/config.py). Public key
+của Signer cũng phải nằm trong `apps/execution-env/trusted-signer-pubkey.asc`
+(gpg import được nhiều key cùng lúc từ 1 file — thêm vào, không cần thay thế
+key remediation nếu đã có) rồi rebuild image:
+```
+docker build --build-arg INSTALL_REMEDIATION_ROLES=false \
+  -t hardening-console-execution-env:latest ./apps/execution-env
+docker compose up -d orchestrator
+```
+
+Ký bản agent mới (sau khi sửa code) lặp lại đúng quy trình trên với `name`
+mới (vd `agent-v2`), rồi cập nhật lại `AGENT_BUNDLE_REF`.
 
 ## Việc CHƯA làm
 

@@ -46,11 +46,19 @@ from sqlalchemy.orm import Session
 
 from app.audit import write_audit_event
 from app.auth import CurrentUser, require_roles
-from app.ca_client import mint_agent_manager_server_cert, mint_ssh_certificate
+from app.ca_client import get_ssh_user_ca_pubkey, mint_agent_manager_server_cert, mint_ssh_certificate
 from app.config import settings
 from app.db import SessionLocal
 from app.models import Control, Host, Job, RemediationVariant
-from app.schemas import AgentVerifyEnrollResponse, JobListOut, JobOut, RemediateApplyRequest, RestoreRequest, ScanTrigger
+from app.schemas import (
+    AgentVerifyEnrollResponse,
+    CaBootstrapRequest,
+    JobListOut,
+    JobOut,
+    RemediateApplyRequest,
+    RestoreRequest,
+    ScanTrigger,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,15 +139,6 @@ SCAP_PROFILES = {
         "profile": "xccdf_org.ssgproject.content_profile_standard",
     },
 }
-
-# Provisioner "orchestrator" trên step-ca chỉ siết TTL (xem
-# infra/step-ca/setup-provisioners.sh), KHÔNG tự giới hạn principal được phép
-# cấp cert — nếu không allowlist ở đây, bất kỳ user có role operator/admin
-# nào cũng có thể tự chọn cấp SSH cert cho principal tuỳ ý qua ScanTrigger
-# (phát hiện qua code review, không phải qua test thật). OpenSCAP cần quyền
-# root để đọc đầy đủ cấu hình hệ thống nên chỉ allowlist "root".
-ALLOWED_SSH_USERS = ("root",)
-
 
 def _get_db():
     db = SessionLocal()
@@ -562,6 +561,8 @@ def _lock_host_for_remediate(db: Session, hostname: str) -> Host:
     host = db.query(Host).filter(Host.hostname == hostname).with_for_update().first()
     if host is None:
         raise HTTPException(status_code=404, detail="host không tồn tại")
+    if host.decommissioned_at is not None:
+        raise HTTPException(status_code=422, detail="host đã decommission — recommission trước khi remediate")
 
     conflicting = (
         db.query(Job)
@@ -775,6 +776,8 @@ def run_restore(db: Session, hostname: str, source_job_id: int, user: CurrentUse
     host = db.get(Host, hostname)
     if host is None:
         raise HTTPException(status_code=404, detail="host không tồn tại")
+    if host.decommissioned_at is not None:
+        raise HTTPException(status_code=422, detail="host đã decommission — recommission trước khi restore")
 
     source_job = db.get(Job, source_job_id)
     if source_job is None:
@@ -962,6 +965,8 @@ def trigger_scan(
     host = db.get(Host, hostname)
     if host is None:
         raise HTTPException(status_code=404, detail="host không tồn tại")
+    if host.decommissioned_at is not None:
+        raise HTTPException(status_code=422, detail="host đã decommission — recommission trước khi scan")
 
     profile_def = SCAP_PROFILES.get(body.scap_profile_key)
     if profile_def is None:
@@ -970,10 +975,17 @@ def trigger_scan(
             detail=f"scap_profile_key không hợp lệ, các giá trị hỗ trợ: {sorted(SCAP_PROFILES)}",
         )
 
-    if body.ssh_user not in ALLOWED_SSH_USERS:
+    # Re-check ĐỘC LẬP với validate lúc sửa host (app/hosts.py:update_host) —
+    # phòng trường hợp settings.allowed_ssh_users bị thắt lại SAU khi host đã
+    # có giá trị không còn hợp lệ (defense-in-depth, cùng mẫu re-check
+    # kill-switch lúc claim thay vì chỉ lúc dispatch — xem app/agents.py).
+    if host.ssh_user not in settings.allowed_ssh_users_set:
         raise HTTPException(
             status_code=422,
-            detail=f"ssh_user không hợp lệ, các giá trị hỗ trợ: {sorted(ALLOWED_SSH_USERS)}",
+            detail=(
+                f"ssh_user hiện tại của host ('{host.ssh_user}') không còn nằm trong "
+                f"allowlist ({sorted(settings.allowed_ssh_users_set)}) — sửa lại qua PATCH /hosts/{{hostname}}"
+            ),
         )
 
     job = Job(
@@ -989,7 +1001,7 @@ def trigger_scan(
     db.refresh(job)
 
     try:
-        private_key, cert_pub = mint_ssh_certificate(principal=body.ssh_user)
+        private_key, cert_pub = mint_ssh_certificate(principal=host.ssh_user)
     except RuntimeError as exc:
         job.status = "failed"
         job.result_summary = {"error": str(exc)}
@@ -1007,7 +1019,7 @@ def trigger_scan(
         "command": ["scan"],
         "environment": {
             "TARGET_HOST": host.ip_address,
-            "SSH_USER": body.ssh_user,
+            "SSH_USER": host.ssh_user,
             "SSH_KEY_B64": base64.b64encode(private_key.encode()).decode(),
             "SSH_CERT_B64": base64.b64encode(cert_pub.encode()).decode(),
             "SCAP_PROFILE": profile_def["profile"],
@@ -1042,6 +1054,268 @@ def trigger_scan(
         action="scan_completed",
         resource=hostname,
         payload={"job_id": job.id, "status": job.status, "summary": summary},
+    )
+    return job
+
+
+def _parse_ssh_check_summary(logs: str) -> dict:
+    summary = {"raw_log_tail": logs[-2000:]}
+    for line in logs.splitlines():
+        if "=" not in line or not line.startswith("SSH_CHECK_"):
+            continue
+        key, _, value = line.partition("=")
+        summary[key.strip().lower()] = value.strip()
+    return summary
+
+
+@router.post("/hosts/{hostname}/ssh-check", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+def trigger_ssh_check(
+    hostname: str,
+    db: Session = Depends(_get_db),
+    user: CurrentUser = Depends(require_roles(*_OPERATOR_ROLES)),
+) -> Job:
+    """Kiểm tra khả năng SSH tới host trước khi trigger scan/remediate thật
+    — dùng đúng cơ chế mint SSH cert ngắn hạn có sẵn (như trigger_scan),
+    KHÔNG lưu/dùng static credential nào (giữ đúng nguyên tắc #1 "no standing
+    privilege"). Chỉ khả thi cho host ĐÃ deploy trust CA — với host
+    `not_started`, chưa có cách nào test mà không cần credential cũ (xem
+    Zero-to-CA Migration playbook, `ansible/README.md`). Không đổi state
+    trên target nên KHÔNG cần four-eyes, giống trigger_scan.
+    """
+    host = db.get(Host, hostname)
+    if host is None:
+        raise HTTPException(status_code=404, detail="host không tồn tại")
+    if host.decommissioned_at is not None:
+        raise HTTPException(status_code=422, detail="host đã decommission — recommission trước khi test SSH")
+
+    if host.ca_migration_status not in ("trust_deployed", "migrated"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "host chưa deploy CA trust (ca_migration_status phải là "
+                "trust_deployed hoặc migrated) — chạy Zero-to-CA Migration "
+                "playbook trước, xem ansible/README.md"
+            ),
+        )
+
+    # Re-check độc lập, cùng lý do trigger_scan ở trên.
+    if host.ssh_user not in settings.allowed_ssh_users_set:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"ssh_user hiện tại của host ('{host.ssh_user}') không còn nằm trong "
+                f"allowlist ({sorted(settings.allowed_ssh_users_set)}) — sửa lại qua PATCH /hosts/{{hostname}}"
+            ),
+        )
+
+    job = Job(
+        hostname=hostname,
+        job_type="ssh-check",
+        status="running",
+        triggered_by=user.username,
+        started_at=datetime.now(timezone.utc),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    try:
+        private_key, cert_pub = mint_ssh_certificate(principal=host.ssh_user)
+    except RuntimeError as exc:
+        job.status = "failed"
+        job.result_summary = {"error": str(exc)}
+        job.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        write_audit_event(
+            actor=user.username, action="ssh_check_failed", resource=hostname,
+            payload={"job_id": job.id, "error": "ca_mint_failed"},
+        )
+        raise HTTPException(status_code=502, detail=f"không cấp được SSH cert cho job: {exc}") from exc
+
+    dispatch_body = {
+        "job_id": str(job.id),
+        "image": settings.allowed_execution_image,
+        "command": ["ssh-check"],
+        "environment": {
+            "TARGET_HOST": host.ip_address,
+            "SSH_USER": host.ssh_user,
+            "SSH_KEY_B64": base64.b64encode(private_key.encode()).decode(),
+            "SSH_CERT_B64": base64.b64encode(cert_pub.encode()).decode(),
+        },
+        "timeout_seconds": 30,
+    }
+
+    try:
+        result = _call_job_dispatcher(dispatch_body, timeout=60)
+    except httpx.HTTPError as exc:
+        job.status = "failed"
+        job.result_summary = {"error": str(exc)}
+        job.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        write_audit_event(
+            actor=user.username, action="ssh_check_failed", resource=hostname,
+            payload={"job_id": job.id, "error": "dispatcher_call_failed"},
+        )
+        raise HTTPException(status_code=502, detail=f"job-dispatcher lỗi: {exc}") from exc
+
+    summary = _parse_ssh_check_summary(result.get("logs", ""))
+    summary["exit_code"] = result.get("exit_code")
+    job.status = "succeeded" if result.get("exit_code") == 0 else "failed"
+    job.result_summary = summary
+    job.finished_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(job)
+
+    write_audit_event(
+        actor=user.username,
+        action="ssh_check_completed",
+        resource=hostname,
+        payload={"job_id": job.id, "status": job.status},
+    )
+    return job
+
+
+def _parse_ca_bootstrap_summary(logs: str) -> dict:
+    # CHỈ đọc dòng CA_BOOTSTRAP_STATUS do ca-bootstrap.sh in ra — KHÔNG bao
+    # giờ đưa credential vào summary (script tự nó cũng không echo lại
+    # credential, xem apps/execution-env/ca-bootstrap.sh).
+    summary = {"raw_log_tail": logs[-2000:]}
+    for line in logs.splitlines():
+        if "=" not in line or not line.startswith("CA_BOOTSTRAP_"):
+            continue
+        key, _, value = line.partition("=")
+        summary[key.strip().lower()] = value.strip()
+    return summary
+
+
+@router.post(
+    "/hosts/{hostname}/bootstrap-ca-trust", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED
+)
+def trigger_ca_bootstrap(
+    hostname: str,
+    body: CaBootstrapRequest,
+    db: Session = Depends(_get_db),
+    user: CurrentUser = Depends(require_roles(*_OPERATOR_ROLES)),
+) -> Job:
+    """Tự động hoá BƯỚC 1 (đẩy public key SSH User CA + bật TrustedUserCAKeys
+    + reload sshd) của Zero-to-CA Migration (ansible/playbooks/
+    zero-to-ca-migration.yml) bằng credential SSH CŨ do operator cung cấp —
+    dùng ĐÚNG 1 LẦN cho job này rồi bỏ, KHÔNG BAO GIỜ lưu vào DB/log/
+    result_summary ở bất kỳ đâu (chỉ truyền qua biến môi trường của 1
+    container execution-env dùng 1 lần, xem
+    apps/execution-env/ca-bootstrap.sh).
+
+    Cố tình CHỈ tự động hoá bước 1 — bước 2 ("thu hồi credential cũ", tương
+    đương ansible/playbooks/revoke-old-credential.yml) VẪN thủ công, đòi hỏi
+    operator tự xác nhận cert mới thật sự dùng được trước (xem
+    ansible/README.md) — không rút ngắn "cửa sổ rủi ro lớn nhất vòng đời hệ
+    thống" (rủi ro #8 architecture-proposal.md) bằng cách tự động cả 2 bước.
+
+    Set `ca_migration_status="trust_deployed"` + `ca_migration_updated_by`
+    (cùng người vừa chạy job này) khi thành công — GIỐNG HỆT ngữ nghĩa PATCH
+    /hosts/{hostname}/ca-migration-status thủ công, để four-eyes xác nhận
+    "migrated" sau này (app/hosts.py:update_ca_migration_status) vẫn áp dụng
+    đúng cho host Tier cao — không set field này sẽ vô tình TẮT four-eyes
+    (cùng lớp bug đã tìm thấy và vá trước đây, xem README.md).
+    """
+    host = db.get(Host, hostname)
+    if host is None:
+        raise HTTPException(status_code=404, detail="host không tồn tại")
+    if host.decommissioned_at is not None:
+        raise HTTPException(
+            status_code=422, detail="host đã decommission — recommission trước khi bootstrap CA trust"
+        )
+    if host.ca_migration_status != "not_started":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"host đã ở trạng thái '{host.ca_migration_status}' — bootstrap CA trust chỉ áp dụng "
+                "cho host còn 'not_started'"
+            ),
+        )
+    if bool(body.legacy_ssh_password) == bool(body.legacy_ssh_private_key):
+        raise HTTPException(
+            status_code=422,
+            detail="phải cung cấp ĐÚNG 1 trong legacy_ssh_password hoặc legacy_ssh_private_key",
+        )
+
+    job = Job(
+        hostname=hostname,
+        job_type="ca-bootstrap",
+        status="running",
+        triggered_by=user.username,
+        started_at=datetime.now(timezone.utc),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    try:
+        ca_pubkey = get_ssh_user_ca_pubkey()
+    except RuntimeError as exc:
+        job.status = "failed"
+        job.result_summary = {"error": str(exc)}
+        job.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        write_audit_event(
+            actor=user.username, action="ca_bootstrap_failed", resource=hostname,
+            payload={"job_id": job.id, "error": "ca_pubkey_fetch_failed"},
+        )
+        raise HTTPException(status_code=502, detail=f"không lấy được SSH User CA public key: {exc}") from exc
+
+    environment = {
+        "TARGET_HOST": host.ip_address,
+        "LEGACY_SSH_USER": body.legacy_ssh_user,
+        "CA_SSH_USER_PUBKEY": ca_pubkey,
+    }
+    if body.legacy_ssh_private_key:
+        environment["LEGACY_SSH_PRIVATE_KEY_B64"] = base64.b64encode(
+            body.legacy_ssh_private_key.encode()
+        ).decode()
+    else:
+        environment["LEGACY_SSH_PASSWORD_B64"] = base64.b64encode(
+            body.legacy_ssh_password.encode()
+        ).decode()
+
+    dispatch_body = {
+        "job_id": str(job.id),
+        "image": settings.allowed_execution_image,
+        "command": ["ca-bootstrap"],
+        "environment": environment,
+        "timeout_seconds": 60,
+    }
+
+    try:
+        result = _call_job_dispatcher(dispatch_body, timeout=90)
+    except httpx.HTTPError as exc:
+        job.status = "failed"
+        job.result_summary = {"error": str(exc)}
+        job.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        write_audit_event(
+            actor=user.username, action="ca_bootstrap_failed", resource=hostname,
+            payload={"job_id": job.id, "error": "dispatcher_call_failed"},
+        )
+        raise HTTPException(status_code=502, detail=f"job-dispatcher lỗi: {exc}") from exc
+
+    summary = _parse_ca_bootstrap_summary(result.get("logs", ""))
+    summary["exit_code"] = result.get("exit_code")
+    job.status = "succeeded" if result.get("exit_code") == 0 else "failed"
+    job.result_summary = summary
+    job.finished_at = datetime.now(timezone.utc)
+
+    if job.status == "succeeded":
+        host.ca_migration_status = "trust_deployed"
+        host.ca_migration_updated_by = user.username
+
+    db.commit()
+    db.refresh(job)
+
+    write_audit_event(
+        actor=user.username,
+        action="ca_bootstrap_completed",
+        resource=hostname,
+        payload={"job_id": job.id, "status": job.status},
     )
     return job
 

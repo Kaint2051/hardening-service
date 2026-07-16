@@ -232,12 +232,16 @@ def _mock_dispatcher(monkeypatch, exit_code_for=None):
     monkeypatch.setattr(httpx, "post", _fake_post)
 
 
-def _register_host(hostname, ip_address, tier=2, os_family="Ubuntu", os_version="22.04"):
+def _register_host(
+    hostname, ip_address, tier=2, os_family="Ubuntu", os_version="22.04", decommissioned=False,
+):
     db = _TestSessionLocal()
     db.add(
         Host(
             hostname=hostname, ip_address=ip_address, os_family=os_family, os_version=os_version,
             tier=tier, added_by="opuser",
+            decommissioned_at=datetime.now(timezone.utc) if decommissioned else None,
+            decommissioned_by="opuser" if decommissioned else None,
         )
     )
     db.commit()
@@ -292,6 +296,18 @@ def _start_rollout(control_id="ctrl-a", username="opuser"):
 
 
 # ---- (1) zero eligible hosts -> completes immediately, no background task ----
+
+
+def test_decommissioned_host_excluded_from_eligible_hosts():
+    _register_control("ctrl-a", maturity="production", risk_group="A")
+    _register_remediation_variant("ctrl-a")
+    # Khớp variant hoàn hảo + đúng Tier 2 NHƯNG đã decommission -> vẫn phải
+    # bị loại (xem app/canary.py truy vấn eligible hosts).
+    _register_host("decommissioned-host.internal", "10.0.9.2", tier=2, decommissioned=True)
+
+    resp = _start_rollout("ctrl-a")
+    assert resp.status_code == 200
+    assert resp.json()["eligible_host_count"] == 0
 
 
 def test_zero_eligible_hosts_all_tier_high_completes_immediately():

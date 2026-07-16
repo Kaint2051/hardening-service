@@ -49,18 +49,57 @@ thiếu sót.
 
 ## Trước khi dùng thật
 
-1. **Điền commit hash đã review vào `requirements.yml`** — hiện đang là
-   placeholder. Không build/deploy image với placeholder còn nguyên.
-2. Build lại image mỗi khi `requirements.yml` đổi, gắn tag theo hash nội dung
-   (`docker build -t execution-env:<content-hash> .`) để Orchestrator có thể
-   pin đúng version image khi tạo job, không dùng tag `latest`.
-3. Nội dung SCAP/benchmark (ComplianceAsCode) KHÔNG nằm trong image này — được
-   mount read-only từ `scripts/content-signing/signed/` lúc chạy container,
-   sau khi đã qua quy trình Puller → Reviewer → Signer.
-4. **Chuẩn bị ít nhất 1 bundle remediation đã ký** theo đúng convention ở
-   trên (playbook.yml + content-signing pipeline) trước khi remediate thật
-   có ý nghĩa — pipeline (Orchestrator endpoint + execution-env script) đã
-   sẵn sàng, chỉ còn thiếu nội dung đã qua review.
+Pipeline kỹ thuật (Orchestrator endpoint + execution-env script + Agent Active
+Response) đã sẵn sàng và verify E2E thật — phần còn thiếu là **2 việc cần
+người/danh tính thật**, không phải code. Cố tình KHÔNG tạo key/commit hash giả
+để "lấp chỗ trống": mục đích của 2 placeholder này là buộc phải có 1 người cụ
+thể chịu trách nhiệm, không phải 1 bước kỹ thuật có thể tự động hoá.
+
+### A. Xác lập Signer thật (`trusted-signer-pubkey.asc`)
+
+1. Tổ chức chỉ định 1 người làm **Signer** — phải KHÁC người làm Puller và
+   Reviewer trong quy trình `scripts/content-signing/` (script tự chặn nếu
+   trùng key, xem `scripts/content-signing/README.md`).
+2. Signer sinh GPG key cá nhân **trên máy của họ** (không phải lab server dùng
+   chung, không phải máy chạy Orchestrator): `gpg --full-generate-key`.
+3. Xuất public key: `gpg --armor --export <fingerprint-đầy-đủ> > trusted-signer-pubkey.asc`.
+4. Thay TOÀN BỘ nội dung `apps/execution-env/trusted-signer-pubkey.asc` bằng
+   output ở bước 3 (public key không bí mật, an toàn commit vào git).
+5. Đặt `CONTENT_SIGNING_TRUSTED_FINGERPRINT` trong `.env` thật (lab/production)
+   bằng đúng fingerprint đầy đủ (40 ký tự hex, không rút gọn 8 ký tự cuối —
+   tránh nhầm lẫn/collision) của key vừa tạo.
+6. Rebuild image theo đúng tag mà `ALLOWED_EXECUTION_IMAGE` (job-dispatcher)
+   trỏ tới, xác nhận log build KHÔNG còn cảnh báo `gpg --import` thất bại.
+7. Verify: ký thử 1 bundle vô hại (vd chỉ tạo 1 file marker trong `/var/tmp`,
+   giống cách đã verify E2E trước đây) qua đúng `pull.sh → review.sh → sign.sh`,
+   chạy `remediate.sh` dry-run xác nhận `verified:true` đúng fingerprint.
+
+### B. Review + ghim Ansible role thật (`requirements.yml`)
+
+1. Reviewer đọc toàn bộ diff của `dev-sec.os-hardening`/`dev-sec.ssh-hardening`
+   tại đúng commit dự kiến dùng (không tin tag/branch, tự đọc code — supply
+   chain risk đã ghi trong `docs/architecture-proposal.md` mục 4.2).
+2. Ghi đầy đủ 40 ký tự commit SHA vào `version:` cho từng role.
+3. Build với `--build-arg INSTALL_REMEDIATION_ROLES=true` (mặc định `false`)
+   để thực sự cài role vào image — trước đó mọi lần build/test chỉ dùng
+   `false` nên bước này CHƯA từng chạy thật.
+4. Verify: build không dừng ở lỗi `pathspec ... did not match` (dấu hiệu vẫn
+   còn placeholder), và `docker run <image> ansible-galaxy role list` thấy
+   đúng 2 role + version đã ghim.
+5. Commit `requirements.yml` (giá trị version không bí mật).
+
+### C. Ký bundle remediation thật đầu tiên
+
+Sau khi (A) xong, dùng đúng quy trình `scripts/content-signing/` (Puller tải
+nội dung remediation thật → Reviewer duyệt diff → Signer ký bằng key đã thiết
+lập ở mục A) cho từng `RemediationVariant.remediation_ref` cần dùng — xem
+`scripts/content-signing/README.md`.
+
+### Ngoài phạm vi engineering — cần quyết định của tổ chức trước khi go-live
+
+- Nội dung STIG/TCVN thật (cần Reviewer chuyên môn compliance).
+- Pentest độc lập cho Agent trước khi bật `ACTIVE_RESPONSE_ENABLED` cho fleet
+  thật (kill-switch cố tình đang tắt).
 
 ## Backup + restore trước/sau remediate
 

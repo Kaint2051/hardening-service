@@ -96,39 +96,81 @@ class ControlVersionOut(BaseModel):
         from_attributes = True
 
 
+def _validate_ip_address_value(v: str) -> str:
+    # Bắt buộc là IP thật (chặn chuỗi kiểu "a@b -oProxyCommand=..." lọt
+    # xuống thẳng lệnh oscap-ssh) và chặn loopback/link-local/multicast/
+    # reserved — vd 169.254.169.254 (cloud metadata endpoint), 127.0.0.1
+    # — để 1 operator không thể tự đăng ký "host" trỏ vào endpoint nội
+    # bộ nhạy cảm rồi trigger scan, khiến cert SSH root thật (mint riêng
+    # cho job) bị StrictHostKeyChecking=no gửi thẳng tới đó (phát hiện
+    # qua review, không phải test thật — xem README). Tách hàm module-level
+    # (không phải method riêng của HostCreate) để HostUpdate tái dùng ĐÚNG
+    # cùng 1 rule khi sửa ip_address, không lệch validation giữa tạo/sửa.
+    try:
+        parsed = ipaddress.ip_address(v)
+    except ValueError as exc:
+        raise ValueError("ip_address phải là địa chỉ IPv4/IPv6 hợp lệ") from exc
+    if (
+        parsed.is_loopback
+        or parsed.is_link_local
+        or parsed.is_unspecified
+        or parsed.is_multicast
+        or parsed.is_reserved
+    ):
+        raise ValueError(
+            "ip_address không được là loopback/link-local/multicast/reserved "
+            "(vd 169.254.169.254, 127.0.0.1)"
+        )
+    return str(parsed)
+
+
 class HostCreate(BaseModel):
     hostname: str = Field(..., max_length=255, pattern=_HOSTNAME_PATTERN)
     ip_address: str = Field(..., max_length=64)
     os_family: str = Field(..., max_length=64)
     os_version: Optional[str] = Field(None, max_length=32)
     tier: int = 2
+    ssh_user: str = Field("root", max_length=64, description="Phải nằm trong settings.allowed_ssh_users")
+    # Lưu THAM KHẢO, mã hoá trước khi ghi DB — CHƯA được job pipeline nào
+    # dùng (scan/remediate/restore/ssh-check đều dùng SSH cert), xem
+    # app/models.py:Host.ssh_password_encrypted.
+    ssh_password: Optional[str] = Field(None, max_length=512)
 
     @field_validator("ip_address")
     @classmethod
     def _validate_ip_address(cls, v: str) -> str:
-        # Bắt buộc là IP thật (chặn chuỗi kiểu "a@b -oProxyCommand=..." lọt
-        # xuống thẳng lệnh oscap-ssh) và chặn loopback/link-local/multicast/
-        # reserved — vd 169.254.169.254 (cloud metadata endpoint), 127.0.0.1
-        # — để 1 operator không thể tự đăng ký "host" trỏ vào endpoint nội
-        # bộ nhạy cảm rồi trigger scan, khiến cert SSH root thật (mint riêng
-        # cho job) bị StrictHostKeyChecking=no gửi thẳng tới đó (phát hiện
-        # qua review, không phải test thật — xem README).
-        try:
-            parsed = ipaddress.ip_address(v)
-        except ValueError as exc:
-            raise ValueError("ip_address phải là địa chỉ IPv4/IPv6 hợp lệ") from exc
-        if (
-            parsed.is_loopback
-            or parsed.is_link_local
-            or parsed.is_unspecified
-            or parsed.is_multicast
-            or parsed.is_reserved
-        ):
-            raise ValueError(
-                "ip_address không được là loopback/link-local/multicast/reserved "
-                "(vd 169.254.169.254, 127.0.0.1)"
-            )
-        return str(parsed)
+        return _validate_ip_address_value(v)
+
+
+class HostUpdate(BaseModel):
+    """Body cho PATCH /hosts/{hostname} — sửa thông tin host đã đăng ký (xem
+    app/hosts.py:update_host). Mọi trường đều optional — chỉ field có mặt
+    trong request mới bị đổi (partial update, khác HostCreate).
+
+    `tier` CHỈ admin được đổi (không phải operator) — đây là ngưỡng
+    four-eyes (Tier 0/1 bắt buộc four-eyes cho CA migration + remediate-
+    apply), để operator tự hạ tier host của chính mình sẽ là đường né
+    four-eyes tương tự lỗ hổng "sửa nội dung Control sau khi đã production"
+    đã tìm thấy và vá trước đây (xem app/controls.py:_demote_if_production).
+
+    Đổi `ip_address` sẽ tự động reset `ca_migration_status` về
+    "not_started" (xem update_host) — trust CA đã deploy là cho địa chỉ CŨ,
+    giữ nguyên "migrated" cho địa chỉ mới sẽ là thông tin sai.
+    """
+
+    ip_address: Optional[str] = Field(None, max_length=64)
+    os_family: Optional[str] = Field(None, max_length=64)
+    os_version: Optional[str] = Field(None, max_length=32)
+    tier: Optional[int] = None
+    ssh_user: Optional[str] = Field(None, max_length=64)
+    # "" (chuỗi rỗng) xoá password đã lưu, None (không truyền field) giữ
+    # nguyên — khác nhau có chủ đích (xem update_host).
+    ssh_password: Optional[str] = Field(None, max_length=512)
+
+    @field_validator("ip_address")
+    @classmethod
+    def _validate_ip_address(cls, v: Optional[str]) -> Optional[str]:
+        return v if v is None else _validate_ip_address_value(v)
 
 
 class HostOut(BaseModel):
@@ -137,6 +179,11 @@ class HostOut(BaseModel):
     os_family: str
     os_version: Optional[str]
     tier: int
+    ssh_user: str
+    # KHÔNG BAO GIỜ trả password/ciphertext qua đây — chỉ cờ đã cấu hình hay
+    # chưa (xem app/models.py:Host.has_ssh_password). Xem giá trị thật qua
+    # GET /hosts/{hostname}/ssh-credential (admin-only, tự ghi audit mỗi lần).
+    has_ssh_password: bool
     ca_migration_status: str
     ca_migration_updated_by: Optional[str]
     added_by: str
@@ -146,13 +193,34 @@ class HostOut(BaseModel):
     agent_last_seen: Optional[datetime]
     agent_renewal_blocked: bool
     active_response_enabled: bool
+    decommissioned_at: Optional[datetime]
+    decommissioned_by: Optional[str]
 
     class Config:
         from_attributes = True
 
 
+class HostSshCredentialOut(BaseModel):
+    """Response cho GET /hosts/{hostname}/ssh-credential — admin-only, tự
+    ghi 1 audit event MỖI LẦN gọi (xem lộ credential đã lưu là hành động
+    nhạy cảm, cần audit từng lần đọc chứ không chỉ từng lần ghi)."""
+
+    hostname: str
+    ssh_user: str
+    ssh_password: Optional[str]
+
+
 class HostMigrationStatusUpdate(BaseModel):
     ca_migration_status: str = Field(..., description=f"1 trong {CA_MIGRATION_STATUSES}")
+
+
+class HostDecommissionUpdate(BaseModel):
+    """Body cho PATCH /hosts/{hostname}/decommission — ngừng/khôi phục quản
+    lý 1 host (xem app/hosts.py). KHÔNG xoá Host record — job/audit history
+    được giữ nguyên, chỉ chặn các hành động mới (scan/remediate/restore/
+    ssh-check/enrollment agent) trên host này cho tới khi recommission."""
+
+    decommissioned: bool
 
 
 class HostAgentRenewalUpdate(BaseModel):
@@ -172,9 +240,28 @@ class HostActiveResponseUpdate(BaseModel):
     enabled: bool
 
 
+class CaBootstrapRequest(BaseModel):
+    """Body cho POST /hosts/{hostname}/bootstrap-ca-trust — dùng credential
+    SSH CŨ (password HOẶC private key, không phải cả hai) ĐÚNG 1 LẦN để tự
+    động hoá bước 1 Zero-to-CA Migration (ansible/playbooks/
+    zero-to-ca-migration.yml), xem app/jobs.py:trigger_ca_bootstrap.
+
+    Credential này KHÔNG được lưu vào DB/log/result_summary ở BẤT KỲ đâu —
+    chỉ truyền qua biến môi trường của 1 container execution-env dùng đúng 1
+    lần rồi huỷ. Pydantic model này chỉ tồn tại trong bộ nhớ tiến trình lúc
+    xử lý request, không có field nào được persist.
+    """
+
+    legacy_ssh_user: str = Field(..., max_length=64)
+    legacy_ssh_password: Optional[str] = None
+    legacy_ssh_private_key: Optional[str] = None
+
+
 class ScanTrigger(BaseModel):
+    # ssh_user KHÔNG còn là tham số request — dùng thẳng Host.ssh_user (mục
+    # "sửa host") để chỉ có đúng 1 nguồn sự thật, tránh operator override tuỳ
+    # ý per-request giá trị đã được xác lập/audit lúc sửa host.
     scap_profile_key: str = Field(..., description="Khoá trong app.jobs.SCAP_PROFILES")
-    ssh_user: str = "root"
 
 
 class JobOut(BaseModel):
@@ -268,6 +355,19 @@ class AgentEnrollmentTokenOut(BaseModel):
     hostname: str
     token: str = Field(..., description="Chỉ trả về đúng 1 lần, không lưu lại được")
     expires_at: datetime
+
+
+class AgentInstallScriptOut(BaseModel):
+    hostname: str
+    expires_at: datetime
+    script: str = Field(
+        ...,
+        description=(
+            "Script bash chứa bootstrap token dùng-1-lần — chỉ trả về đúng 1 "
+            "lần, không lưu lại được. Dán vào phiên SSH của chính operator "
+            "tới máy đích, KHÔNG phải Orchestrator tự chạy."
+        ),
+    )
 
 
 class AgentVerifyEnrollRequest(BaseModel):

@@ -308,7 +308,7 @@ def start_canary_rollout(
 
     hosts = (
         db.query(Host)
-        .filter(Host.tier == _CANARY_HOST_TIER)
+        .filter(Host.tier == _CANARY_HOST_TIER, Host.decommissioned_at.is_(None))
         .order_by(Host.hostname.asc())
         .all()
     )

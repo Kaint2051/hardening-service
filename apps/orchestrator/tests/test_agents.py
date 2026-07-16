@@ -5,6 +5,7 @@ import base64
 import os
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import jwt as pyjwt
 import pytest
 from fastapi.testclient import TestClient
@@ -86,15 +87,46 @@ def _clear_user_override():
     app.dependency_overrides.pop(get_current_user, None)
 
 
-def _register_host(hostname="agent-test.internal", blocked=False, active_response_enabled=True):
+def _register_host(
+    hostname="agent-test.internal", blocked=False, active_response_enabled=True,
+    ca_migration_status="not_started", ssh_user="root", decommissioned=False,
+):
     db = _TestSessionLocal()
     db.add(Host(
         hostname=hostname, ip_address="10.0.0.50", os_family="Ubuntu",
         os_version="24.04", added_by="opuser", agent_renewal_blocked=blocked,
         active_response_enabled=active_response_enabled,
+        ca_migration_status=ca_migration_status, ssh_user=ssh_user,
+        decommissioned_at=datetime.now(timezone.utc) if decommissioned else None,
+        decommissioned_by="opuser" if decommissioned else None,
     ))
     db.commit()
     db.close()
+
+
+def _mock_agent_install_dispatch(monkeypatch, exit_code=0, logs="AGENT_INSTALL_STATUS=ok\n"):
+    # Mirror test_jobs.py's _mock_cert/_mock_dispatcher_success — nhưng
+    # trigger_agent_install gọi mint_ssh_certificate qua namespace agents_module
+    # (import trực tiếp vào app/agents.py), còn mint_agent_manager_server_cert
+    # + httpx.post là 2 lời gọi NỘI BỘ của _call_job_dispatcher (định nghĩa
+    # trong app/jobs.py) nên phải mock trên jobs_module/httpx global, KHÔNG
+    # phải agents_module — patch nhầm namespace sẽ không có tác dụng gì.
+    monkeypatch.setattr(
+        agents_module, "mint_ssh_certificate", lambda principal: ("FAKE-PRIVATE-KEY", "FAKE-CERT-PUB")
+    )
+    monkeypatch.setattr(
+        jobs_module, "mint_agent_manager_server_cert",
+        lambda subject="agent-manager": ("FAKE-CLIENT-CERT-PEM", "FAKE-CLIENT-KEY-PEM"),
+    )
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"job_id": "1", "exit_code": exit_code, "logs": logs}
+
+    monkeypatch.setattr(httpx, "post", lambda *a, **kw: _FakeResponse())
 
 
 def _fake_ott(hostname="agent-test.internal", jti="test-jti-1", ttl_seconds=300):
@@ -117,6 +149,34 @@ def test_create_enrollment_token_unknown_host_404():
     assert resp.status_code == 404
 
 
+def test_create_enrollment_token_blocked_when_decommissioned():
+    db = _TestSessionLocal()
+    db.add(Host(
+        hostname="decommissioned-host.internal", ip_address="10.0.0.60", os_family="Ubuntu",
+        added_by="opuser", decommissioned_at=datetime.now(timezone.utc), decommissioned_by="opuser",
+    ))
+    db.commit()
+    db.close()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/decommissioned-host.internal/agent-enrollment-tokens")
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_generate_install_script_blocked_when_decommissioned():
+    db = _TestSessionLocal()
+    db.add(Host(
+        hostname="decommissioned-host.internal", ip_address="10.0.0.60", os_family="Ubuntu",
+        added_by="opuser", decommissioned_at=datetime.now(timezone.utc), decommissioned_by="opuser",
+    ))
+    db.commit()
+    db.close()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/decommissioned-host.internal/agent-install-script")
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
 def test_create_enrollment_token_success(monkeypatch, _mock_audit):
     _register_host()
     fake_token = _fake_ott()
@@ -131,6 +191,88 @@ def test_create_enrollment_token_success(monkeypatch, _mock_audit):
     assert body["token"] == fake_token
     assert body["hostname"] == "agent-test.internal"
     assert _mock_audit[0]["action"] == "agent_enrollment_token_created"
+
+
+def _write_fake_assets(tmp_path):
+    assets_dir = tmp_path / "agent-assets"
+    assets_dir.mkdir()
+    (assets_dir / "provision.sh").write_text("echo provision-marker\n", encoding="utf-8")
+    (assets_dir / "hardening-agent.service").write_text(
+        "[Unit]\nDescription=fake agent unit\n", encoding="utf-8"
+    )
+    (assets_dir / "hardening-executor.service").write_text(
+        "[Unit]\nDescription=fake executor unit\n", encoding="utf-8"
+    )
+    return assets_dir
+
+
+def test_non_operator_cannot_generate_install_script():
+    _register_host()
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.post("/hosts/agent-test.internal/agent-install-script")
+    _clear_user_override()
+    assert resp.status_code == 403
+
+
+def test_generate_install_script_unknown_host_404():
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/does-not-exist/agent-install-script")
+    _clear_user_override()
+    assert resp.status_code == 404
+
+
+def test_generate_install_script_success(monkeypatch, tmp_path, _mock_audit):
+    _register_host()
+    fake_token = _fake_ott()
+    monkeypatch.setattr(agents_module, "create_agent_enrollment_token", lambda hostname: fake_token)
+    monkeypatch.setattr(agents_module.settings, "agent_assets_dir", str(_write_fake_assets(tmp_path)))
+
+    ca_root_file = tmp_path / "root_ca.crt"
+    ca_root_file.write_text("-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n", encoding="utf-8")
+    monkeypatch.setattr(agents_module.settings, "stepca_root_cert_path", str(ca_root_file))
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-test.internal/agent-install-script")
+    _clear_user_override()
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["hostname"] == "agent-test.internal"
+    script = body["script"]
+    # Gộp đủ cả 4 phần: token, ca-root, provision.sh, 2 unit file.
+    assert fake_token in script
+    assert "-----BEGIN CERTIFICATE-----" in script
+    assert "echo provision-marker" in script
+    assert "fake agent unit" in script
+    assert "fake executor unit" in script
+    assert _mock_audit[-1]["action"] == "agent_install_script_generated"
+
+    # Tái dùng đúng logic bookkeeping cũ — vẫn tạo 1 dòng agent_enrollment_tokens
+    # (không lệch khỏi hành vi của create_enrollment_token).
+    db = _TestSessionLocal()
+    token_row = (
+        db.query(agents_module.AgentEnrollmentToken)
+        .filter_by(hostname="agent-test.internal")
+        .first()
+    )
+    db.close()
+    assert token_row is not None
+    assert token_row.jti == "test-jti-1"
+
+
+def test_generate_install_script_missing_assets_returns_500(monkeypatch, tmp_path):
+    _register_host()
+    fake_token = _fake_ott()
+    monkeypatch.setattr(agents_module, "create_agent_enrollment_token", lambda hostname: fake_token)
+    monkeypatch.setattr(agents_module.settings, "agent_assets_dir", str(tmp_path / "does-not-exist"))
+    ca_root_file = tmp_path / "root_ca.crt"
+    ca_root_file.write_text("FAKE-CA-ROOT\n", encoding="utf-8")
+    monkeypatch.setattr(agents_module.settings, "stepca_root_cert_path", str(ca_root_file))
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-test.internal/agent-install-script")
+    _clear_user_override()
+    assert resp.status_code == 500
 
 
 def test_verify_and_enroll_requires_shared_secret():
@@ -804,4 +946,209 @@ def test_remediate_result_does_not_truncate_small_backup():
     job = db.get(Job, job_id)
     db.close()
     assert job.result_summary["backup_truncated"] is False
-    assert job.result_summary["backup_tar_b64"] == "ZmFrZS1iYWNrdXAtdGFyLWNvbnRlbnQ="
+
+
+# ---- POST /hosts/{hostname}/agent-install (remote-deploy tự động, khác
+# create_agent_install_script dán tay — xem app/agents.py:trigger_agent_install) ----
+
+
+def test_non_operator_cannot_trigger_agent_install():
+    _register_host(ca_migration_status="trust_deployed")
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.post("/hosts/agent-test.internal/agent-install")
+    _clear_user_override()
+    assert resp.status_code == 403
+
+
+def test_trigger_agent_install_unknown_host_404():
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/does-not-exist/agent-install")
+    _clear_user_override()
+    assert resp.status_code == 404
+
+
+def test_trigger_agent_install_blocked_when_decommissioned():
+    _register_host(ca_migration_status="trust_deployed", decommissioned=True)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-test.internal/agent-install")
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_trigger_agent_install_blocked_when_not_started():
+    # Mặc định _register_host() để ca_migration_status="not_started" — chưa
+    # deploy CA trust thì chưa có cách nào SSH bằng cert ephemeral được.
+    _register_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-test.internal/agent-install")
+    _clear_user_override()
+    assert resp.status_code == 422
+    assert "ca_migration_status" in resp.json()["detail"] or "trust_deployed" in resp.json()["detail"]
+
+
+def test_trigger_agent_install_rejects_ssh_user_not_in_allowlist():
+    # Defense-in-depth, cùng lý do test_scan_rejects_host_ssh_user_no_longer_in_allowlist
+    # (test_jobs.py) — allowlist bị thắt lại SAU khi host đã có giá trị cũ.
+    _register_host(ca_migration_status="trust_deployed", ssh_user="scanner-svc")
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-test.internal/agent-install")
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_trigger_agent_install_requires_agent_bundle_ref_configured(monkeypatch):
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_ref", "")
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_trusted_fingerprint", "TEST-FPR-1234")
+    _register_host(ca_migration_status="trust_deployed")
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-test.internal/agent-install")
+    _clear_user_override()
+    assert resp.status_code == 422
+    assert "AGENT_BUNDLE_REF" in resp.json()["detail"]
+    # Chưa qua được bước validate đầu tiên — không nên tạo Job row nào.
+    db = _TestSessionLocal()
+    count = db.query(Job).filter(Job.hostname == "agent-test.internal").count()
+    db.close()
+    assert count == 0
+
+
+def test_trigger_agent_install_requires_agent_bundle_trusted_fingerprint_configured(monkeypatch):
+    # agent_bundle_ref CỐ Ý tách khỏi content_signing_trusted_fingerprint
+    # (dùng cho remediation) — thiếu RIÊNG fingerprint (dù đã có ref) cũng
+    # phải chặn, không phải chỉ thiếu ref mới chặn.
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_ref", "agent-v1-20260101T000000Z")
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_trusted_fingerprint", "")
+    _register_host(ca_migration_status="trust_deployed")
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-test.internal/agent-install")
+    _clear_user_override()
+    assert resp.status_code == 422
+    assert "AGENT_BUNDLE_TRUSTED_FINGERPRINT" in resp.json()["detail"]
+
+
+def test_trigger_agent_install_requires_agent_manager_public_url_configured(monkeypatch):
+    # hardening-agent.service mặc định AGENT_MANAGER_URL=https://localhost:8443
+    # (chỉ đúng khi Agent Manager chạy CÙNG máy) — thiếu biến này thì job
+    # "chạy xong" nhưng Agent trên host thật KHÔNG BAO GIỜ enroll được (lỗi
+    # âm thầm đã gặp thật), nên chặn NGAY từ lúc trigger, không để lọt xuống
+    # execution-env.
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_ref", "agent-v1-20260101T000000Z")
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_trusted_fingerprint", "TEST-FPR-1234")
+    monkeypatch.setattr(agents_module.settings, "agent_manager_public_url", "")
+    _register_host(ca_migration_status="trust_deployed")
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-test.internal/agent-install")
+    _clear_user_override()
+    assert resp.status_code == 422
+    assert "AGENT_MANAGER_PUBLIC_URL" in resp.json()["detail"]
+
+
+def test_trigger_agent_install_success(monkeypatch, _mock_audit):
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_ref", "agent-v1-20260101T000000Z")
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_trusted_fingerprint", "TEST-FPR-1234")
+    monkeypatch.setattr(agents_module.settings, "agent_manager_public_url", "https://192.0.2.1:8443")
+    _register_host(ca_migration_status="trust_deployed")
+    _mock_agent_install_dispatch(monkeypatch, exit_code=0, logs="AGENT_INSTALL_STATUS=ok\nReporter da chay\n")
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-test.internal/agent-install")
+    _clear_user_override()
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["status"] == "succeeded"
+    assert body["job_type"] == "agent-install"
+
+    db = _TestSessionLocal()
+    job = db.get(Job, body["id"])
+    db.close()
+    assert job.result_summary["agent_install_status"] == "ok"
+    assert job.result_summary["exit_code"] == 0
+
+    completed = [c for c in _mock_audit if c["action"] == "agent_install_completed"]
+    assert len(completed) == 1
+    assert completed[0]["payload"]["status"] == "succeeded"
+
+
+def test_trigger_agent_install_script_failure_returns_202_with_failed_job(monkeypatch):
+    # Script chạy được (dispatcher không lỗi) nhưng exit_code != 0 (vd verify
+    # chữ ký bundle thất bại trên execution-env) — job "failed" nhưng response
+    # HTTP vẫn 202 (khác nhánh cert-mint/dispatcher lỗi hạ tầng, trả 502).
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_ref", "agent-v1-20260101T000000Z")
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_trusted_fingerprint", "TEST-FPR-1234")
+    monkeypatch.setattr(agents_module.settings, "agent_manager_public_url", "https://192.0.2.1:8443")
+    _register_host(ca_migration_status="trust_deployed")
+    _mock_agent_install_dispatch(
+        monkeypatch, exit_code=1,
+        logs="AGENT_INSTALL_STATUS=failed\nChu ky bundle khong hop le\n",
+    )
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-test.internal/agent-install")
+    _clear_user_override()
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["status"] == "failed"
+
+
+def test_trigger_agent_install_cert_mint_failure_returns_502_and_marks_job_failed(monkeypatch, _mock_audit):
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_ref", "agent-v1-20260101T000000Z")
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_trusted_fingerprint", "TEST-FPR-1234")
+    monkeypatch.setattr(agents_module.settings, "agent_manager_public_url", "https://192.0.2.1:8443")
+    _register_host(ca_migration_status="trust_deployed")
+
+    def _raise(principal):
+        raise RuntimeError("step-ca không phản hồi")
+
+    monkeypatch.setattr(agents_module, "mint_ssh_certificate", _raise)
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-test.internal/agent-install")
+    _clear_user_override()
+
+    assert resp.status_code == 502
+    failed = [c for c in _mock_audit if c["action"] == "agent_install_failed"]
+    assert len(failed) == 1
+    assert failed[0]["payload"]["error"] == "ca_mint_failed"
+
+    db = _TestSessionLocal()
+    jobs = db.query(Job).filter(Job.hostname == "agent-test.internal").all()
+    db.close()
+    assert len(jobs) == 1
+    assert jobs[0].status == "failed"
+    assert jobs[0].finished_at is not None
+
+
+def test_trigger_agent_install_dispatcher_failure_returns_502_and_marks_job_failed(monkeypatch, _mock_audit):
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_ref", "agent-v1-20260101T000000Z")
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_trusted_fingerprint", "TEST-FPR-1234")
+    monkeypatch.setattr(agents_module.settings, "agent_manager_public_url", "https://192.0.2.1:8443")
+    _register_host(ca_migration_status="trust_deployed")
+    monkeypatch.setattr(
+        agents_module, "mint_ssh_certificate", lambda principal: ("FAKE-PRIVATE-KEY", "FAKE-CERT-PUB")
+    )
+    monkeypatch.setattr(
+        jobs_module, "mint_agent_manager_server_cert",
+        lambda subject="agent-manager": ("FAKE-CLIENT-CERT-PEM", "FAKE-CLIENT-KEY-PEM"),
+    )
+
+    def _raise_connect_error(*a, **kw):
+        raise httpx.ConnectError("job-dispatcher không phản hồi")
+
+    monkeypatch.setattr(httpx, "post", _raise_connect_error)
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-test.internal/agent-install")
+    _clear_user_override()
+
+    assert resp.status_code == 502
+    failed = [c for c in _mock_audit if c["action"] == "agent_install_failed"]
+    assert len(failed) == 1
+    assert failed[0]["payload"]["error"] == "dispatcher_call_failed"
+
+    db = _TestSessionLocal()
+    jobs = db.query(Job).filter(Job.hostname == "agent-test.internal").all()
+    db.close()
+    assert len(jobs) == 1
+    assert jobs[0].status == "failed"

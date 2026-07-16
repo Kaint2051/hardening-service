@@ -155,3 +155,37 @@ def mint_agent_manager_server_cert(subject: str = "agent-manager") -> tuple[str,
     """
     token = create_agent_enrollment_token(subject, ttl="5m")
     return mint_agent_client_cert(subject, token)
+
+
+def get_ssh_user_ca_pubkey() -> str:
+    """Trả về public key (1 dòng, format OpenSSH) của SSH User CA — dùng để
+    đẩy vào `/etc/ssh/user_ca.pub` + `TrustedUserCAKeys` trên host lúc
+    bootstrap CA trust (mục "Zero-to-CA Migration", xem app/jobs.py:
+    trigger_ca_bootstrap và ansible/playbooks/zero-to-ca-migration.yml —
+    thủ công trước đây phải `docker compose exec step-ca step ssh config
+    --roots`, giờ Orchestrator tự lấy qua đúng `--ca-url`/`--root` đã dùng
+    cho mint_ssh_certificate, KHÔNG cần exec vào container step-ca).
+
+    Public key KHÔNG bí mật (chỉ private key của CA mới bí mật) — an toàn để
+    trả qua API/nhúng vào script mà không cần xác thực đặc biệt.
+
+    Raises RuntimeError cho mọi lỗi (cùng hợp đồng với mint_ssh_certificate).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "step", "ssh", "config", "--roots",
+                "--ca-url", settings.stepca_url,
+                "--root", settings.stepca_root_cert_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"lấy SSH User CA public key thất bại: {result.stderr.strip()}")
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"lấy SSH User CA public key timeout sau {exc.timeout}s") from exc
+    except OSError as exc:
+        raise RuntimeError(f"lỗi hệ thống khi lấy SSH User CA public key: {exc}") from exc

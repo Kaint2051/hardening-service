@@ -70,7 +70,10 @@ def _clear_user_override():
     app.dependency_overrides.pop(get_current_user, None)
 
 
-def _register_host(hostname="scan-target.internal", tier=2, os_family="Ubuntu", os_version="22.04"):
+def _register_host(
+    hostname="scan-target.internal", tier=2, os_family="Ubuntu", os_version="22.04",
+    ca_migration_status="not_started", decommissioned=False, ssh_user="root",
+):
     db = _TestSessionLocal()
     db.add(Host(
         hostname=hostname,
@@ -78,6 +81,10 @@ def _register_host(hostname="scan-target.internal", tier=2, os_family="Ubuntu", 
         os_family=os_family,
         os_version=os_version,
         tier=tier,
+        ssh_user=ssh_user,
+        ca_migration_status=ca_migration_status,
+        decommissioned_at=datetime.now(timezone.utc) if decommissioned else None,
+        decommissioned_by="opuser" if decommissioned else None,
         added_by="opuser",
     ))
     db.commit()
@@ -167,12 +174,47 @@ def test_invalid_profile_key_422():
     assert resp.status_code == 422
 
 
-def test_invalid_ssh_user_rejected():
-    _register_host()
+def test_scan_uses_hosts_configured_ssh_user(monkeypatch):
+    # ssh_user KHÔNG còn là tham số request (xem app/schemas.py:ScanTrigger)
+    # — dùng thẳng Host.ssh_user, kể cả khi khác "root" (miễn nằm trong
+    # settings.allowed_ssh_users, mặc định chỉ "root" nhưng test override).
+    monkeypatch.setattr(jobs_module.settings, "allowed_ssh_users", "root,scanner-svc")
+    _register_host(ssh_user="scanner-svc")
+    captured = {}
+
+    def _capture_mint(principal):
+        captured["principal"] = principal
+        return "FAKE-KEY", "FAKE-CERT"
+
+    monkeypatch.setattr(jobs_module, "mint_ssh_certificate", _capture_mint)
+    _mock_dispatcher_success(monkeypatch, exit_code=0)
     app.dependency_overrides[get_current_user] = _as("opuser", "operator")
     resp = client.post(
-        "/hosts/scan-target.internal/scan",
-        json={"scap_profile_key": "ubuntu2204-standard", "ssh_user": "attacker-chosen-user"},
+        "/hosts/scan-target.internal/scan", json={"scap_profile_key": "ubuntu2204-standard"}
+    )
+    _clear_user_override()
+    assert resp.status_code == 202
+    assert captured["principal"] == "scanner-svc"
+
+
+def test_scan_rejects_host_ssh_user_no_longer_in_allowlist():
+    # Defense-in-depth: allowlist bị thắt lại SAU khi host đã có giá trị cũ
+    # (vd tổ chức đổi ALLOWED_SSH_USERS trong .env) — trigger_scan phải tự
+    # chặn lại, không chỉ tin giá trị đã lưu từ lúc sửa host.
+    _register_host(ssh_user="scanner-svc")  # "scanner-svc" KHÔNG nằm trong default allowlist ("root")
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/scan", json={"scap_profile_key": "ubuntu2204-standard"}
+    )
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_scan_blocked_when_decommissioned():
+    _register_host(decommissioned=True)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/scan", json={"scap_profile_key": "ubuntu2204-standard"}
     )
     _clear_user_override()
     assert resp.status_code == 422
@@ -307,6 +349,265 @@ def test_dispatcher_unreachable_returns_502(monkeypatch):
     assert resp.status_code == 502
 
 
+# ---- job_type="ssh-check" (app/jobs.py:trigger_ssh_check) ----
+
+def test_ssh_check_requires_operator_role():
+    _register_host(ca_migration_status="trust_deployed")
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.post("/hosts/scan-target.internal/ssh-check")
+    _clear_user_override()
+    assert resp.status_code == 403
+
+
+def test_ssh_check_unknown_host_404():
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/does-not-exist/ssh-check")
+    _clear_user_override()
+    assert resp.status_code == 404
+
+
+def test_ssh_check_blocked_when_ca_not_started():
+    # Host mặc định "not_started" (chưa deploy trust CA) — không có cách nào
+    # test SSH mà không dùng static credential cũ, xem docstring trigger_ssh_check.
+    _register_host(ca_migration_status="not_started")
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/ssh-check")
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_ssh_check_blocked_when_decommissioned():
+    _register_host(ca_migration_status="trust_deployed", decommissioned=True)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/ssh-check")
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_ssh_check_success_when_trust_deployed(monkeypatch):
+    _register_host(ca_migration_status="trust_deployed")
+    _mock_dispatcher_success(
+        monkeypatch, exit_code=0, logs="SSH_CHECK_STATUS=ok\nSSH_CHECK_UNAME=Linux test 6.8.0\n"
+    )
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/ssh-check")
+    _clear_user_override()
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["job_type"] == "ssh-check"
+    assert body["status"] == "succeeded"
+    assert body["result_summary"]["ssh_check_status"] == "ok"
+    assert "Linux test" in body["result_summary"]["ssh_check_uname"]
+
+
+def test_ssh_check_success_when_migrated(monkeypatch):
+    # "migrated" cũng hợp lệ, không chỉ "trust_deployed" — cả 2 trạng thái
+    # đều đã tin CA (khác biệt duy nhất là revoke credential cũ hay chưa).
+    _register_host(ca_migration_status="migrated")
+    _mock_dispatcher_success(
+        monkeypatch, exit_code=0, logs="SSH_CHECK_STATUS=ok\nSSH_CHECK_UNAME=Linux test\n"
+    )
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/ssh-check")
+    _clear_user_override()
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "succeeded"
+
+
+def test_ssh_check_failure_marks_job_failed(monkeypatch):
+    _register_host(ca_migration_status="trust_deployed")
+    _mock_dispatcher_success(monkeypatch, exit_code=1, logs="SSH_CHECK_STATUS=failed\n")
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/ssh-check")
+    _clear_user_override()
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "failed"
+
+
+def test_ssh_check_cert_mint_failure_marks_job_failed(monkeypatch, _mock_cert):
+    _register_host(ca_migration_status="trust_deployed")
+
+    def _raise(principal):
+        raise RuntimeError("step-ca từ chối cấp")
+
+    monkeypatch.setattr(jobs_module, "mint_ssh_certificate", _raise)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/ssh-check")
+    _clear_user_override()
+    assert resp.status_code == 502
+    assert _mock_cert[-1]["action"] == "ssh_check_failed"
+
+
+# ---- job_type="ca-bootstrap" (app/jobs.py:trigger_ca_bootstrap) — bootstrap
+# CA trust bằng credential SSH CŨ, dùng ĐÚNG 1 LẦN, KHÔNG lưu lại ----
+
+_FAKE_LEGACY_PASSWORD = "s3cr3t-legacy-pass-do-not-leak"
+_FAKE_CA_PUBKEY = "ecdsa-sha2-nistp256 AAAAFAKEFAKEFAKE fake-ca-key"
+
+
+def _mock_ca_pubkey(monkeypatch, pubkey=_FAKE_CA_PUBKEY):
+    monkeypatch.setattr(jobs_module, "get_ssh_user_ca_pubkey", lambda: pubkey)
+
+
+def test_ca_bootstrap_requires_operator_role():
+    _register_host()
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-ca-trust",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": _FAKE_LEGACY_PASSWORD},
+    )
+    _clear_user_override()
+    assert resp.status_code == 403
+
+
+def test_ca_bootstrap_unknown_host_404():
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/does-not-exist/bootstrap-ca-trust",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": _FAKE_LEGACY_PASSWORD},
+    )
+    _clear_user_override()
+    assert resp.status_code == 404
+
+
+def test_ca_bootstrap_blocked_when_decommissioned():
+    _register_host(decommissioned=True)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-ca-trust",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": _FAKE_LEGACY_PASSWORD},
+    )
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_ca_bootstrap_blocked_when_not_not_started():
+    _register_host(ca_migration_status="trust_deployed")
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-ca-trust",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": _FAKE_LEGACY_PASSWORD},
+    )
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_ca_bootstrap_requires_exactly_one_credential_neither():
+    _register_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-ca-trust", json={"legacy_ssh_user": "root"}
+    )
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_ca_bootstrap_requires_exactly_one_credential_both():
+    _register_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-ca-trust",
+        json={
+            "legacy_ssh_user": "root", "legacy_ssh_password": _FAKE_LEGACY_PASSWORD,
+            "legacy_ssh_private_key": "-----BEGIN KEY-----\nfake\n-----END KEY-----",
+        },
+    )
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_ca_bootstrap_pubkey_fetch_failure_marks_job_failed(monkeypatch, _mock_cert):
+    _register_host()
+
+    def _raise():
+        raise RuntimeError("step ssh config --roots thất bại")
+
+    monkeypatch.setattr(jobs_module, "get_ssh_user_ca_pubkey", _raise)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-ca-trust",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": _FAKE_LEGACY_PASSWORD},
+    )
+    _clear_user_override()
+    assert resp.status_code == 502
+    assert _mock_cert[-1]["action"] == "ca_bootstrap_failed"
+
+
+def test_ca_bootstrap_success_sets_trust_deployed_and_updated_by(monkeypatch):
+    _register_host()
+    _mock_ca_pubkey(monkeypatch)
+    _mock_dispatcher_success(monkeypatch, exit_code=0, logs="CA_BOOTSTRAP_STATUS=trust_deployed\n")
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-ca-trust",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": _FAKE_LEGACY_PASSWORD},
+    )
+    _clear_user_override()
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["job_type"] == "ca-bootstrap"
+    assert body["status"] == "succeeded"
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "scan-target.internal")
+    db.close()
+    assert host.ca_migration_status == "trust_deployed"
+    # PHẢI set updated_by = người vừa chạy job này — nếu để None sẽ vô tình
+    # tắt hẳn four-eyes lúc xác nhận "migrated" sau này cho Tier cao (cùng
+    # lớp bug đã tìm thấy và vá trước đây, xem README.md).
+    assert host.ca_migration_updated_by == "opuser"
+
+
+def test_ca_bootstrap_failure_keeps_not_started(monkeypatch):
+    _register_host()
+    _mock_ca_pubkey(monkeypatch)
+    _mock_dispatcher_success(monkeypatch, exit_code=1, logs="CA_BOOTSTRAP_STATUS=failed\n")
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-ca-trust",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": _FAKE_LEGACY_PASSWORD},
+    )
+    _clear_user_override()
+
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "failed"
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "scan-target.internal")
+    db.close()
+    assert host.ca_migration_status == "not_started"
+    assert host.ca_migration_updated_by is None
+
+
+def test_ca_bootstrap_does_not_leak_credential(monkeypatch, _mock_cert):
+    # Bug nghiêm trọng nếu xảy ra: credential lộ vào audit payload hoặc
+    # result_summary. Test bằng cách chạy thật qua toàn bộ code path rồi
+    # xác nhận chuỗi password KHÔNG xuất hiện ở bất kỳ đâu observable được.
+    _register_host()
+    _mock_ca_pubkey(monkeypatch)
+    _mock_dispatcher_success(monkeypatch, exit_code=0, logs="CA_BOOTSTRAP_STATUS=trust_deployed\n")
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-ca-trust",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": _FAKE_LEGACY_PASSWORD},
+    )
+    _clear_user_override()
+
+    assert resp.status_code == 202
+    assert _FAKE_LEGACY_PASSWORD not in resp.text
+    for call in _mock_cert:
+        assert _FAKE_LEGACY_PASSWORD not in str(call)
+
+    db = _TestSessionLocal()
+    job = db.query(Job).filter(Job.job_type == "ca-bootstrap").order_by(Job.id.desc()).first()
+    db.close()
+    assert _FAKE_LEGACY_PASSWORD not in str(job.result_summary)
+
+
 def test_get_job_any_role(monkeypatch):
     _register_host()
     _mock_dispatcher_success(monkeypatch)
@@ -350,6 +651,17 @@ def test_viewer_cannot_trigger_remediate_dry_run():
     resp = client.post("/hosts/scan-target.internal/controls/ctrl-1/remediate/dry-run")
     _clear_user_override()
     assert resp.status_code == 403
+
+
+def test_remediate_dry_run_blocked_when_decommissioned(monkeypatch):
+    # _lock_host_for_remediate là điểm chặn DUY NHẤT dùng chung cho cả
+    # dry-run/apply/canary (xem docstring hàm đó) — test qua dry-run là đủ
+    # đại diện, không cần lặp lại riêng cho apply.
+    _register_host(decommissioned=True)
+    _register_control()
+    _register_remediation_variant()
+    resp = _do_dry_run(monkeypatch)
+    assert resp.status_code == 422
 
 
 def test_remediate_dry_run_unknown_host_404():
@@ -687,6 +999,32 @@ def test_restore_requires_source_job_id_exists():
     _register_host()
     app.dependency_overrides[get_current_user] = _as("opuser", "operator")
     resp = client.post("/hosts/scan-target.internal/restore", json={"source_job_id": 999999})
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def _decommission_host(hostname="scan-target.internal"):
+    db = _TestSessionLocal()
+    host = db.query(Host).filter(Host.hostname == hostname).first()
+    host.decommissioned_at = datetime.now(timezone.utc)
+    host.decommissioned_by = "opuser"
+    db.commit()
+    db.close()
+
+
+def test_restore_blocked_when_decommissioned(monkeypatch):
+    # Host phải CÒN active lúc tạo job apply nguồn (decommission bản thân nó
+    # cũng chặn remediate — xem test_remediate_dry_run_blocked_when_decommissioned),
+    # rồi mới decommission SAU KHI đã có job succeeded, mô phỏng đúng tình
+    # huống thật: host bị decommission sau khi đã remediate xong.
+    _register_host()
+    _register_control()
+    _register_remediation_variant()
+    apply_job_id = _succeeded_apply_job_id(monkeypatch)
+    _decommission_host()
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/restore", json={"source_job_id": apply_job_id})
     _clear_user_override()
     assert resp.status_code == 422
 

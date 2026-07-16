@@ -26,6 +26,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         git \
         gnupg \
+        # Chỉ dùng cho ca-bootstrap.sh (bootstrap CA trust bằng credential CŨ
+        # dạng password, mục "Zero-to-CA Migration" — xem app/jobs.py:
+        # trigger_ca_bootstrap). Đọc password qua -f <file> (không phải -p
+        # <chuỗi>) để tránh lộ qua `ps aux`.
+        sshpass \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir --break-system-packages ansible-runner==2.4.0
@@ -62,7 +67,10 @@ RUN gpg --import /tmp/trusted-signer-pubkey.asc 2>&1 || \
 COPY scan.sh /usr/local/bin/scan.sh
 COPY remediate.sh /usr/local/bin/remediate.sh
 COPY restore.sh /usr/local/bin/restore.sh
+COPY ssh-check.sh /usr/local/bin/ssh-check.sh
+COPY ca-bootstrap.sh /usr/local/bin/ca-bootstrap.sh
+COPY agent-install.sh /usr/local/bin/agent-install.sh
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /usr/local/bin/scan.sh /usr/local/bin/remediate.sh /usr/local/bin/restore.sh /entrypoint.sh
+RUN chmod +x /usr/local/bin/scan.sh /usr/local/bin/remediate.sh /usr/local/bin/restore.sh /usr/local/bin/ssh-check.sh /usr/local/bin/ca-bootstrap.sh /usr/local/bin/agent-install.sh /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

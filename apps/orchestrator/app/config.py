@@ -78,6 +78,60 @@ class Settings(BaseSettings):
     # Ở đây là mount read-only trực tiếp vào chính container Orchestrator
     # (xem docker-compose.yml, cùng vật lý với CONTENT_SIGNING_SIGNED_HOST_PATH).
     content_signing_signed_dir: str = "/content-signed"
+    # Mount read-only 3 file tĩnh từ apps/agent/ (provision.sh + 2 systemd
+    # unit) — dùng để sinh script cài Agent gộp sẵn cho operator dán vào
+    # phiên SSH của chính họ (xem app/agents.py:_build_agent_install_script).
+    # Đọc TRỰC TIẾP từ file thật trong repo (không copy/paste lại nội dung
+    # vào code Python) để không bao giờ lệch khỏi bản gốc nếu ai đó sửa
+    # provision.sh/unit file sau này.
+    agent_assets_dir: str = "/agent-assets"
+    # Tên bundle đã ký hiện hành trong scripts/content-signing/signed/, chứa
+    # agent+executor binary + provision.sh + 2 systemd unit — dùng bởi
+    # POST /hosts/{hostname}/agent-install (app/agents.py) để remote-deploy
+    # Agent tự động (không cần operator tự SSH/paste tay, khác
+    # _build_agent_install_script cũ). Operator tự cập nhật giá trị này mỗi
+    # khi ký 1 bản build agent mới qua đúng quy trình 3 vai trò
+    # (scripts/content-signing/README.md). KHÔNG hard-required lúc khởi động
+    # (app vẫn chạy được trước khi có bundle đầu tiên) — endpoint tự báo lỗi
+    # rõ ràng nếu rỗng, xem trigger_agent_install.
+    agent_bundle_ref: str = ""
+    # Fingerprint GPG tin cậy RIÊNG cho bundle agent — CỐ Ý tách khỏi
+    # content_signing_trusted_fingerprint (dùng cho remediation content) dù
+    # cùng cơ chế 3 vai trò/cùng file trusted-signer-pubkey.asc (gpg import
+    # được nhiều key cùng lúc từ 1 file). Lý do: agent_bundle_ref có thể được
+    # ký bởi 1 authority/lịch ký khác remediation — dùng chung 1 setting sẽ
+    # khiến đổi 1 trong 2 bên vô tình làm hỏng verify của bên còn lại (phát
+    # hiện lúc chuẩn bị ký bundle agent thật lần đầu: fingerprint đang cấu
+    # hình cho remediation, đổi sang key agent sẽ làm mọi bundle remediation
+    # đã ký trước đó không còn verify được nữa).
+    agent_bundle_trusted_fingerprint: str = ""
+    # Địa chỉ Agent Manager mà AGENT THẬT (chạy trên máy đích trong fleet,
+    # ngoài docker network này) gọi tới — PHẢI là địa chỉ external (khớp
+    # "ports: 8443:8443" của agent-manager trong docker-compose.yml, vd
+    # "https://172.30.2.111:8443"), KHÔNG phải "localhost" (mặc định của
+    # chính agent binary, chỉ đúng khi Agent Manager chạy CÙNG máy với Agent
+    # — xem apps/agent/hardening-agent.service). Thiếu biến này, agent-install
+    # (cả tự động và dán tay) vẫn "chạy xong" (script cài đặt không lỗi) nhưng
+    # Agent trên host thật KHÔNG BAO GIỜ enroll được — lỗi âm thầm, phát hiện
+    # qua audit log thiếu "agent_enrolled" dù "agent_install_completed" đã có
+    # (không phải suy đoán — xem app/agents.py:_build_agent_env_file).
+    agent_manager_public_url: str = ""
+    # Allowlist principal SSH cho scan/ssh-check (mục "sửa host"), phân cách
+    # dấu phẩy — quyết định ở CẤP TRIỂN KHAI (.env), không phải operator tự
+    # chọn tuỳ ý qua UI: provisioner "orchestrator" trên step-ca không tự
+    # giới hạn principal được phép cấp cert, nên đây là lớp chặn DUY NHẤT
+    # (xem app/jobs.py ALLOWED_SSH_USERS cũ, giờ chuyển thành setting này).
+    # remediate-apply/restore KHÔNG dùng allowlist này — luôn cứng "root".
+    allowed_ssh_users: str = "root"
+    # Mã hoá Host.ssh_password_encrypted (xem app/hosts.py) — Fernet key
+    # (`python3 -c "from cryptography.fernet import Fernet; print(Fernet.
+    # generate_key().decode())"`), PHẢI khác secret_key và không dùng chung
+    # với bất kỳ secret nào khác — khoá này KHÔNG lưu trong DB (đúng nguyên
+    # tắc "khoá giải mã tách khỏi nơi lưu dữ liệu đã mã hoá"), chỉ ở .env.
+    # LƯU Ý: đây KHÔNG chặn được kịch bản Orchestrator (ứng dụng) bị chiếm —
+    # ứng dụng tự giải mã được thì kẻ tấn công qua ứng dụng cũng vậy; chỉ
+    # chặn được kịch bản lộ riêng bản backup DB mà không lộ kèm .env/server.
+    host_credential_encryption_key: str = ""
 
     class Config:
         env_file = ".env"
@@ -89,6 +143,10 @@ class Settings(BaseSettings):
     @property
     def keycloak_client_ids_set(self) -> frozenset[str]:
         return frozenset(c.strip() for c in self.keycloak_client_ids.split(",") if c.strip())
+
+    @property
+    def allowed_ssh_users_set(self) -> frozenset[str]:
+        return frozenset(u.strip() for u in self.allowed_ssh_users.split(",") if u.strip())
 
     @model_validator(mode="after")
     def _reject_empty_required_secrets(self) -> "Settings":
@@ -111,6 +169,7 @@ class Settings(BaseSettings):
             "stepca_provisioner_password": self.stepca_provisioner_password,
             "agent_manager_shared_secret": self.agent_manager_shared_secret,
             "content_signing_trusted_fingerprint": self.content_signing_trusted_fingerprint,
+            "host_credential_encryption_key": self.host_credential_encryption_key,
         }
         empty = [name for name, value in required_nonempty.items() if not value]
         if empty:

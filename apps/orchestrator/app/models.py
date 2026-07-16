@@ -236,6 +236,20 @@ class Host(Base):
     os_family = Column(String(64), nullable=False)
     os_version = Column(String(32), nullable=True)
     tier = Column(Integer, nullable=False, server_default="2")
+    # Principal dùng cho scan/ssh-check qua SSH (mục "sửa host") — PHẢI nằm
+    # trong settings.allowed_ssh_users (enforce ở app/hosts.py lúc sửa VÀ lại
+    # ở app/jobs.py lúc trigger, phòng trường hợp allowlist bị thắt lại SAU
+    # khi host đã có giá trị không còn hợp lệ). remediate-apply/restore
+    # KHÔNG dùng cột này — luôn cứng "root" vì Ansible playbook bắt buộc ghi
+    # /etc/ssh, /etc/pam.d, /etc/sysctl.d cần quyền root, không có ngoại lệ.
+    ssh_user = Column(String(64), nullable=False, server_default="root")
+    # Password SSH lưu THAM KHẢO theo yêu cầu người dùng — mã hoá bằng Fernet
+    # (settings.host_credential_encryption_key, xem app/hosts.py), KHÔNG bao
+    # giờ lưu plaintext. CHƯA được job pipeline nào dùng tới (scan/ssh-check/
+    # remediate/restore đều dùng SSH cert, không dùng password) — quyết định
+    # có chủ đích, xem trao đổi trong README.md mục liên quan. NULL nghĩa là
+    # chưa cấu hình password cho host này.
+    ssh_password_encrypted = Column(Text, nullable=True)
     ca_migration_status = Column(String(32), nullable=False, server_default="not_started")
     ca_migration_updated_by = Column(String(255), nullable=True)
     added_by = Column(String(255), nullable=False)
@@ -271,6 +285,21 @@ class Host(Base):
     # như Postgres) khiến cột luôn truthy ngay từ dòng đầu tiên khi test qua
     # SQLite.
     active_response_enabled = Column(Boolean, nullable=False, server_default=false())
+    # Ngừng quản lý (mục "Host Registry — decommission"): NULL = đang quản lý
+    # (mặc định). Đặt cả 2 cột (KHÔNG chỉ 1 cờ Boolean) để giữ được audit
+    # trail lúc nào/ai đã decommission, cùng mẫu ca_migration_updated_by ở
+    # trên — KHÔNG hard-delete Host record (jobs.hostname là FK RESTRICT tới
+    # hosts.hostname, không có ondelete=CASCADE, nên hard-delete sẽ luôn thất
+    # bại với host đã từng chạy job — cố tình, giữ nguyên lịch sử audit/job).
+    decommissioned_at = Column(DateTime(timezone=True), nullable=True)
+    decommissioned_by = Column(String(255), nullable=True)
+
+    @property
+    def has_ssh_password(self) -> bool:
+        # Property Python thuần (KHÔNG phải Column) — HostOut đọc field này
+        # qua from_attributes để báo "đã cấu hình/chưa" mà KHÔNG bao giờ trả
+        # ciphertext (nói gì tới plaintext) qua GET /hosts, xem app/schemas.py.
+        return self.ssh_password_encrypted is not None
 
 
 class AgentEnrollmentToken(Base):

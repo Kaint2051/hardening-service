@@ -59,6 +59,13 @@ export default function JobsPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   const detailRequestIdRef = useRef(0);
 
+  // "1-click restore" (break-glass, xem app/jobs.py:run_restore) — chỉ hiện
+  // cho job remediate-apply đã succeeded. Yêu cầu 1 bước xác nhận rõ ràng
+  // trong dialog (không tự chạy ngay khi bấm nút đầu tiên) vì đây là hành
+  // động ghi đè cấu hình thật trên host, không thể hoàn tác.
+  const [restoreConfirming, setRestoreConfirming] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+
   // Đổi filter/trang liên tiếp trước khi request trước hoàn tất có thể khiến
   // response CŨ (vd hostname "web-01" chậm hơn) ghi đè lên response MỚI hơn
   // (vd "web-02" nhanh hơn, tới trước) — cùng lớp bug đã gặp và sửa ở
@@ -105,6 +112,7 @@ export default function JobsPage() {
     setDetailJobId(jobId);
     setDetailJob(null);
     setDetailLoading(true);
+    setRestoreConfirming(false);
     api
       .getJob(jobId)
       .then((result) => {
@@ -127,9 +135,30 @@ export default function JobsPage() {
     ++detailRequestIdRef.current;
     setDetailJobId(null);
     setDetailJob(null);
+    setRestoreConfirming(false);
+  };
+
+  const handleRestore = async () => {
+    if (!detailJob) return;
+    setRestoring(true);
+    try {
+      const restoreJob = await api.restoreHost(detailJob.hostname, detailJob.id);
+      setSnack({
+        severity: "success",
+        message: `Đã tạo job restore #${restoreJob.id} (${restoreJob.status}) cho ${detailJob.hostname} — xem chi tiết trong bảng.`,
+      });
+      closeJobDetail();
+      loadJobs();
+    } catch (err) {
+      setSnack({ severity: "error", message: err instanceof ApiError ? err.message : String(err) });
+    } finally {
+      setRestoring(false);
+    }
   };
 
   const findings = (detailJob?.result_summary?.findings as Finding[] | undefined) ?? [];
+  const backupTruncated = Boolean(detailJob?.result_summary?.backup_truncated);
+  const canOfferRestore = detailJob?.job_type === "remediate-apply" && detailJob?.status === "succeeded";
 
   return (
     <Stack spacing={2}>
@@ -318,6 +347,47 @@ export default function JobsPage() {
                     : "(chưa có result_summary)"}
                 </Typography>
               )}
+              {canOfferRestore &&
+                (backupTruncated ? (
+                  <Alert severity="warning">
+                    Backup của job này đã bị cắt bớt lúc chụp (vượt giới hạn dung lượng) —
+                    không thể restore tự động, cần khôi phục thủ công.
+                  </Alert>
+                ) : restoreConfirming ? (
+                  <Alert
+                    severity="warning"
+                    action={
+                      <Stack direction="row" spacing={1}>
+                        <Button size="small" onClick={() => setRestoreConfirming(false)} disabled={restoring}>
+                          Huỷ
+                        </Button>
+                        <Button
+                          size="small"
+                          color="warning"
+                          variant="contained"
+                          onClick={handleRestore}
+                          disabled={restoring}
+                          startIcon={restoring ? <CircularProgress size={14} /> : undefined}
+                        >
+                          Xác nhận restore
+                        </Button>
+                      </Stack>
+                    }
+                  >
+                    Sẽ khôi phục <strong>{detailJob.hostname}</strong> về đúng cấu hình đã backup
+                    trước khi job #{detailJob.id} apply — ghi đè mọi thay đổi đã áp dụng sau đó.
+                    Không yêu cầu duyệt lại (break-glass), không thể hoàn tác.
+                  </Alert>
+                ) : (
+                  <Button
+                    variant="outlined"
+                    color="warning"
+                    onClick={() => setRestoreConfirming(true)}
+                    sx={{ alignSelf: "flex-start" }}
+                  >
+                    Restore từ backup job này
+                  </Button>
+                ))}
             </Stack>
           )}
         </DialogContent>

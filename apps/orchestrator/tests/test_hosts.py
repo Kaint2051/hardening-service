@@ -6,10 +6,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from datetime import datetime, timezone
+
+from cryptography.fernet import Fernet
+
 from app import hosts as hosts_module
 from app.auth import CurrentUser, get_current_user
 from app.db import Base
 from app.main import app
+from app.models import Job
 
 _engine = create_engine(
     "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
@@ -19,9 +24,19 @@ _TestSessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False
 
 @pytest.fixture(autouse=True)
 def _fresh_schema():
-    Base.metadata.create_all(bind=_engine, tables=[Base.metadata.tables["hosts"]])
+    Base.metadata.create_all(
+        bind=_engine, tables=[Base.metadata.tables["hosts"], Base.metadata.tables["jobs"]]
+    )
     yield
     Base.metadata.drop_all(bind=_engine)
+
+
+@pytest.fixture(autouse=True)
+def _mock_encryption_key(monkeypatch):
+    # Test riêng, không dùng key thật của .env — mỗi lần chạy test này tự
+    # sinh 1 key hợp lệ, đủ để verify logic encrypt/decrypt mà không phụ
+    # thuộc cấu hình môi trường.
+    monkeypatch.setattr(hosts_module.settings, "host_credential_encryption_key", Fernet.generate_key().decode())
 
 
 def _override_db():
@@ -414,3 +429,467 @@ def test_active_response_update_writes_audit_event(_mock_audit):
     assert _mock_audit[1]["action"] == "active_response_enabled_updated"
     assert _mock_audit[1]["resource"] == "pilot-host-01.internal"
     assert _mock_audit[1]["payload"] == {"enabled": True}
+
+
+# ---- PATCH /hosts/{hostname}/decommission (ngừng/khôi phục quản lý, KHÔNG
+# xoá record — xem docstring app/hosts.py để biết lý do không có hard-delete) ----
+
+
+def test_new_host_not_decommissioned_by_default():
+    resp = _register_sample_host()
+    assert resp.status_code == 201
+    assert resp.json()["decommissioned_at"] is None
+    assert resp.json()["decommissioned_by"] is None
+
+
+def test_rule_editor_cannot_update_decommission():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("bob", "rule-editor")
+    resp = client.patch(
+        "/hosts/pilot-host-01.internal/decommission",
+        json={"decommissioned": True},
+    )
+    _clear_user_override()
+    assert resp.status_code == 403
+
+
+@pytest.mark.parametrize("role", ["operator", "admin"])
+def test_operator_or_admin_decommissions_and_recommissions_host(role):
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", role)
+
+    resp = client.patch(
+        "/hosts/pilot-host-01.internal/decommission",
+        json={"decommissioned": True},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["decommissioned_at"] is not None
+    assert body["decommissioned_by"] == "opuser"
+
+    resp2 = client.patch(
+        "/hosts/pilot-host-01.internal/decommission",
+        json={"decommissioned": False},
+    )
+    _clear_user_override()
+    assert resp2.status_code == 200
+    body2 = resp2.json()
+    assert body2["decommissioned_at"] is None
+    assert body2["decommissioned_by"] is None
+
+
+def test_decommission_update_unknown_host_404():
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.patch(
+        "/hosts/does-not-exist/decommission",
+        json={"decommissioned": True},
+    )
+    _clear_user_override()
+    assert resp.status_code == 404
+
+
+def test_decommission_twice_returns_409():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    client.patch("/hosts/pilot-host-01.internal/decommission", json={"decommissioned": True})
+    resp = client.patch("/hosts/pilot-host-01.internal/decommission", json={"decommissioned": True})
+    _clear_user_override()
+    assert resp.status_code == 409
+
+
+def test_recommission_when_not_decommissioned_returns_409():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.patch("/hosts/pilot-host-01.internal/decommission", json={"decommissioned": False})
+    _clear_user_override()
+    assert resp.status_code == 409
+
+
+def test_decommission_update_writes_audit_event(_mock_audit):
+    _register_sample_host()  # ghi 1 audit event (host_registered)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.patch(
+        "/hosts/pilot-host-01.internal/decommission",
+        json={"decommissioned": True},
+    )
+    _clear_user_override()
+    assert resp.status_code == 200
+    assert len(_mock_audit) == 2
+    assert _mock_audit[1]["actor"] == "opuser"
+    assert _mock_audit[1]["action"] == "host_decommissioned"
+    assert _mock_audit[1]["resource"] == "pilot-host-01.internal"
+
+
+def test_list_hosts_excludes_decommissioned_by_default():
+    _register_sample_host()  # "pilot-host-01.internal"
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    client.post(
+        "/hosts",
+        json={"hostname": "pilot-host-02.internal", "ip_address": "10.0.0.12", "os_family": "Debian"},
+    )
+    client.patch("/hosts/pilot-host-01.internal/decommission", json={"decommissioned": True})
+
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    default_resp = client.get("/hosts")
+    all_resp = client.get("/hosts?include_decommissioned=true")
+    _clear_user_override()
+
+    default_hostnames = {h["hostname"] for h in default_resp.json()}
+    all_hostnames = {h["hostname"] for h in all_resp.json()}
+    assert default_hostnames == {"pilot-host-02.internal"}
+    assert all_hostnames == {"pilot-host-01.internal", "pilot-host-02.internal"}
+
+
+def test_ca_migration_status_update_blocked_when_decommissioned():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    client.patch("/hosts/pilot-host-01.internal/decommission", json={"decommissioned": True})
+    resp = client.patch(
+        "/hosts/pilot-host-01.internal/ca-migration-status",
+        json={"ca_migration_status": "trust_deployed"},
+    )
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+# ---- ssh_user (mục "sửa host" — Host.ssh_user, xem app/hosts.py/app/jobs.py) ----
+
+
+def test_new_host_defaults_ssh_user_to_root():
+    resp = _register_sample_host()
+    assert resp.status_code == 201
+    assert resp.json()["ssh_user"] == "root"
+
+
+def test_register_host_rejects_ssh_user_not_in_allowlist():
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts",
+        json={
+            "hostname": "pilot-host-03.internal", "ip_address": "10.0.0.13",
+            "os_family": "Debian", "ssh_user": "attacker-chosen-user",
+        },
+    )
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_register_host_accepts_ssh_user_in_custom_allowlist(monkeypatch):
+    monkeypatch.setattr(hosts_module.settings, "allowed_ssh_users", "root,scanner-svc")
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts",
+        json={
+            "hostname": "pilot-host-04.internal", "ip_address": "10.0.0.14",
+            "os_family": "Debian", "ssh_user": "scanner-svc",
+        },
+    )
+    _clear_user_override()
+    assert resp.status_code == 201
+    assert resp.json()["ssh_user"] == "scanner-svc"
+
+
+# ---- PATCH /hosts/{hostname} (sửa host — mục "sửa host") ----
+
+
+def test_rule_editor_cannot_update_host():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("bob", "rule-editor")
+    resp = client.patch("/hosts/pilot-host-01.internal", json={"os_family": "Ubuntu"})
+    _clear_user_override()
+    assert resp.status_code == 403
+
+
+def test_update_host_unknown_host_404():
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.patch("/hosts/does-not-exist", json={"os_family": "Ubuntu"})
+    _clear_user_override()
+    assert resp.status_code == 404
+
+
+def test_update_host_blocked_when_decommissioned():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    client.patch("/hosts/pilot-host-01.internal/decommission", json={"decommissioned": True})
+    resp = client.patch("/hosts/pilot-host-01.internal", json={"os_family": "Ubuntu"})
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_operator_updates_os_family_and_os_version():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.patch(
+        "/hosts/pilot-host-01.internal",
+        json={"os_family": "Ubuntu", "os_version": "24.04"},
+    )
+    _clear_user_override()
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["os_family"] == "Ubuntu"
+    assert body["os_version"] == "24.04"
+
+
+def test_operator_cannot_update_tier():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.patch("/hosts/pilot-host-01.internal", json={"tier": 0})
+    _clear_user_override()
+    assert resp.status_code == 403
+
+
+def test_admin_can_update_tier():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("adminuser", "admin")
+    resp = client.patch("/hosts/pilot-host-01.internal", json={"tier": 0})
+    _clear_user_override()
+    assert resp.status_code == 200
+    assert resp.json()["tier"] == 0
+
+
+def test_update_host_rejects_ssh_user_not_in_allowlist():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.patch(
+        "/hosts/pilot-host-01.internal", json={"ssh_user": "attacker-chosen-user"}
+    )
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_update_ip_address_resets_ca_migration_status():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    client.patch(
+        "/hosts/pilot-host-01.internal/ca-migration-status",
+        json={"ca_migration_status": "trust_deployed"},
+    )
+    resp = client.patch("/hosts/pilot-host-01.internal", json={"ip_address": "10.0.0.99"})
+    _clear_user_override()
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ip_address"] == "10.0.0.99"
+    assert body["ca_migration_status"] == "not_started"
+    assert body["ca_migration_updated_by"] is None
+
+
+def test_update_host_rejects_bad_ip_address():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.patch("/hosts/pilot-host-01.internal", json={"ip_address": "169.254.169.254"})
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_update_host_writes_audit_event(_mock_audit):
+    _register_sample_host()  # ghi 1 audit event (host_registered)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.patch(
+        "/hosts/pilot-host-01.internal", json={"os_family": "Ubuntu"}
+    )
+    _clear_user_override()
+    assert resp.status_code == 200
+    assert len(_mock_audit) == 2
+    assert _mock_audit[1]["actor"] == "opuser"
+    assert _mock_audit[1]["action"] == "host_updated"
+    assert _mock_audit[1]["resource"] == "pilot-host-01.internal"
+    assert _mock_audit[1]["payload"]["changes"]["os_family"] == {"from": "Debian", "to": "Ubuntu"}
+
+
+def test_update_host_with_no_changes_is_a_noop(_mock_audit):
+    _register_sample_host()  # ghi 1 audit event (host_registered)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.patch("/hosts/pilot-host-01.internal", json={"os_family": "Debian"})
+    _clear_user_override()
+    assert resp.status_code == 200
+
+
+# ---- ssh_password (lưu THAM KHẢO, mã hoá — xem app/hosts.py, CHƯA dùng cho
+# job pipeline nào) ----
+
+_FAKE_SSH_PASSWORD = "s3cr3t-reference-password-do-not-leak"
+
+
+def test_register_host_with_ssh_password_sets_has_ssh_password_flag():
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts",
+        json={
+            "hostname": "pilot-host-05.internal", "ip_address": "10.0.0.15",
+            "os_family": "Debian", "ssh_password": _FAKE_SSH_PASSWORD,
+        },
+    )
+    _clear_user_override()
+    assert resp.status_code == 201
+    assert resp.json()["has_ssh_password"] is True
+
+
+def test_register_host_without_ssh_password_flag_false():
+    resp = _register_sample_host()
+    assert resp.status_code == 201
+    assert resp.json()["has_ssh_password"] is False
+
+
+def test_ssh_password_never_exposed_via_host_out():
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    client.post(
+        "/hosts",
+        json={
+            "hostname": "pilot-host-06.internal", "ip_address": "10.0.0.16",
+            "os_family": "Debian", "ssh_password": _FAKE_SSH_PASSWORD,
+        },
+    )
+    resp = client.get("/hosts/pilot-host-06.internal")
+    _clear_user_override()
+    assert resp.status_code == 200
+    assert "ssh_password" not in resp.json()
+    assert "ssh_password_encrypted" not in resp.json()
+    assert _FAKE_SSH_PASSWORD not in resp.text
+
+
+def test_update_host_sets_ssh_password():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.patch(
+        "/hosts/pilot-host-01.internal", json={"ssh_password": _FAKE_SSH_PASSWORD}
+    )
+    _clear_user_override()
+    assert resp.status_code == 200
+    assert resp.json()["has_ssh_password"] is True
+    assert _FAKE_SSH_PASSWORD not in resp.text
+
+
+def test_update_host_clears_ssh_password_with_empty_string():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    client.patch("/hosts/pilot-host-01.internal", json={"ssh_password": _FAKE_SSH_PASSWORD})
+    resp = client.patch("/hosts/pilot-host-01.internal", json={"ssh_password": ""})
+    _clear_user_override()
+    assert resp.status_code == 200
+    assert resp.json()["has_ssh_password"] is False
+
+
+def test_update_host_audit_does_not_leak_ssh_password(_mock_audit):
+    _register_sample_host()  # 1 audit event (host_registered)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    client.patch("/hosts/pilot-host-01.internal", json={"ssh_password": _FAKE_SSH_PASSWORD})
+    _clear_user_override()
+    assert len(_mock_audit) == 2
+    assert _mock_audit[1]["payload"]["changes"]["ssh_password"] == "updated"
+    assert _FAKE_SSH_PASSWORD not in str(_mock_audit[1])
+
+
+# ---- GET /hosts/{hostname}/ssh-credential ----
+
+
+def test_get_ssh_credential_requires_operator_role():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.get("/hosts/pilot-host-01.internal/ssh-credential")
+    _clear_user_override()
+    assert resp.status_code == 403
+
+
+def test_get_ssh_credential_unknown_host_404():
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.get("/hosts/does-not-exist/ssh-credential")
+    _clear_user_override()
+    assert resp.status_code == 404
+
+
+def test_get_ssh_credential_returns_none_when_not_set():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.get("/hosts/pilot-host-01.internal/ssh-credential")
+    _clear_user_override()
+    assert resp.status_code == 200
+    assert resp.json()["ssh_password"] is None
+
+
+def test_get_ssh_credential_decrypts_correctly():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    client.patch("/hosts/pilot-host-01.internal", json={"ssh_password": _FAKE_SSH_PASSWORD})
+    resp = client.get("/hosts/pilot-host-01.internal/ssh-credential")
+    _clear_user_override()
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ssh_password"] == _FAKE_SSH_PASSWORD
+    assert body["ssh_user"] == "root"
+
+
+def test_get_ssh_credential_writes_audit_event(_mock_audit):
+    _register_sample_host()  # 1 audit event
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.get("/hosts/pilot-host-01.internal/ssh-credential")
+    _clear_user_override()
+    assert resp.status_code == 200
+    assert len(_mock_audit) == 2
+    assert _mock_audit[1]["action"] == "host_ssh_credential_viewed"
+    assert _mock_audit[1]["actor"] == "opuser"
+
+
+# ---- DELETE /hosts/{hostname} (hard-delete, chỉ khi CHƯA có job history) ----
+
+
+def _insert_job(hostname="pilot-host-01.internal", job_type="scan"):
+    db = _TestSessionLocal()
+    db.add(Job(
+        hostname=hostname, job_type=job_type, status="succeeded",
+        triggered_by="opuser", started_at=datetime.now(timezone.utc),
+    ))
+    db.commit()
+    db.close()
+
+
+def test_delete_host_requires_admin_role():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.delete("/hosts/pilot-host-01.internal")
+    _clear_user_override()
+    assert resp.status_code == 403
+
+
+def test_delete_host_unknown_host_404():
+    app.dependency_overrides[get_current_user] = _as("adminuser", "admin")
+    resp = client.delete("/hosts/does-not-exist")
+    _clear_user_override()
+    assert resp.status_code == 404
+
+
+def test_delete_host_without_job_history_succeeds():
+    _register_sample_host()
+    app.dependency_overrides[get_current_user] = _as("adminuser", "admin")
+    resp = client.delete("/hosts/pilot-host-01.internal")
+    _clear_user_override()
+    assert resp.status_code == 204
+
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    get_resp = client.get("/hosts/pilot-host-01.internal")
+    _clear_user_override()
+    assert get_resp.status_code == 404
+
+
+def test_delete_host_with_job_history_returns_409():
+    _register_sample_host()
+    _insert_job()
+    app.dependency_overrides[get_current_user] = _as("adminuser", "admin")
+    resp = client.delete("/hosts/pilot-host-01.internal")
+    _clear_user_override()
+    assert resp.status_code == 409
+
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    get_resp = client.get("/hosts/pilot-host-01.internal")
+    _clear_user_override()
+    assert get_resp.status_code == 200  # host vẫn còn nguyên
+
+
+def test_delete_host_writes_audit_event(_mock_audit):
+    _register_sample_host()  # 1 audit event
+    app.dependency_overrides[get_current_user] = _as("adminuser", "admin")
+    resp = client.delete("/hosts/pilot-host-01.internal")
+    _clear_user_override()
+    assert resp.status_code == 204
+    assert len(_mock_audit) == 2
+    assert _mock_audit[1]["action"] == "host_deleted"
+    assert _mock_audit[1]["actor"] == "adminuser"

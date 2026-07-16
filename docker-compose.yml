@@ -160,6 +160,16 @@ services:
       STEPCA_PROVISIONER_PASSWORD: ${STEPCA_PROVISIONER_PASSWORD}
       JOB_DISPATCHER_URL: https://job-dispatcher:9100
       JOB_DISPATCHER_SHARED_SECRET: ${JOB_DISPATCHER_SHARED_SECRET}
+      # Allowlist principal SSH cho Host.ssh_user (mục "sửa host", xem
+      # app/hosts.py/app/jobs.py) — fallback "root" nếu thiếu trong .env
+      # (deploy cũ chưa có dòng này vẫn giữ đúng hành vi trước đây, không
+      # âm thầm thành chuỗi rỗng như các secret bắt buộc khác).
+      ALLOWED_SSH_USERS: ${ALLOWED_SSH_USERS:-root}
+      # Mã hoá Host.ssh_password_encrypted (app/hosts.py) — BẮT BUỘC không
+      # rỗng (xem app/config.py:_reject_empty_required_secrets), không có
+      # fallback mặc định vì đây là khoá bảo mật thật, không phải hành vi an
+      # toàn nếu thiếu.
+      HOST_CREDENTIAL_ENCRYPTION_KEY: ${HOST_CREDENTIAL_ENCRYPTION_KEY}
       # Agent Manager (mục 4.3, chưa triển khai service Go thật trong pass
       # này) sẽ gọi vào /internal/agent/* bằng secret này — cùng pattern
       # JOB_DISPATCHER_SHARED_SECRET.
@@ -168,6 +178,19 @@ services:
       # bundle remediation trước khi chạy ansible-playbook — xem app/jobs.py
       # và scripts/content-signing/README.md.
       CONTENT_SIGNING_TRUSTED_FINGERPRINT: ${CONTENT_SIGNING_TRUSTED_FINGERPRINT}
+      # Tên bundle agent đã ký hiện hành (POST /hosts/{hostname}/agent-install,
+      # xem app/agents.py) — fallback rỗng nếu thiếu trong .env (deploy cũ
+      # chưa có dòng này vẫn boot được, chỉ endpoint agent-install báo lỗi rõ
+      # ràng khi gọi, không phải app từ chối khởi động).
+      AGENT_BUNDLE_REF: ${AGENT_BUNDLE_REF:-}
+      # Fingerprint GPG tin cậy RIÊNG cho bundle agent — CỐ Ý tách khỏi
+      # CONTENT_SIGNING_TRUSTED_FINGERPRINT (dùng cho remediation), xem
+      # app/config.py:agent_bundle_trusted_fingerprint.
+      AGENT_BUNDLE_TRUSTED_FINGERPRINT: ${AGENT_BUNDLE_TRUSTED_FINGERPRINT:-}
+      # Địa chỉ Agent Manager THẬT (khớp "ports: 8443:8443" của agent-manager
+      # bên dưới) — agent-install nhúng vào agent.env của Agent trên máy đích,
+      # xem app/config.py:agent_manager_public_url.
+      AGENT_MANAGER_PUBLIC_URL: ${AGENT_MANAGER_PUBLIC_URL:-}
       # step ssh certificate --ca-url bắt buộc phải verify root cert (không có
       # cờ nào bỏ qua bước này, đã verify thật — step-cli từ chối chạy nếu
       # thiếu --root/--token). Root cert KHÔNG phải bí mật (chỉ root KEY mới
@@ -189,6 +212,13 @@ services:
       # container Orchestrator (khác cơ chế Docker-outside-of-Docker mà
       # job-dispatcher dùng cho execution-env sibling container).
       - ${CONTENT_SIGNING_SIGNED_HOST_PATH}:/content-signed:ro
+      # 3 file tĩnh dùng để sinh script cài Agent gộp sẵn (POST
+      # /hosts/{hostname}/agent-install-script, xem app/agents.py) — đọc
+      # TRỰC TIẾP từ apps/agent/ thay vì copy nội dung vào code Python, để
+      # không lệch khỏi bản gốc nếu ai đó sửa provision.sh/unit file sau này.
+      - ./apps/agent/provision.sh:/agent-assets/provision.sh:ro
+      - ./apps/agent/hardening-agent.service:/agent-assets/hardening-agent.service:ro
+      - ./apps/agent/executor/hardening-executor.service:/agent-assets/hardening-executor.service:ro
     depends_on:
       postgres:
         condition: service_healthy

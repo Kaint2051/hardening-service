@@ -1,6 +1,7 @@
 import keycloak from "../auth/keycloak";
 import type {
   AgentEnrollmentTokenOut,
+  AgentInstallScriptOut,
   CaMigrationStatus,
   CanaryRolloutDetailOut,
   CanaryRolloutOut,
@@ -8,6 +9,7 @@ import type {
   ControlOut,
   ControlVersionOut,
   HostOut,
+  HostSshCredentialOut,
   JobListItemOut,
   JobOut,
 } from "./types";
@@ -61,28 +63,101 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   me: () => request<{ username: string; roles: string[] }>("/me"),
 
-  listHosts: (caMigrationStatus?: CaMigrationStatus) =>
-    request<HostOut[]>(
-      `/hosts${caMigrationStatus ? `?ca_migration_status=${caMigrationStatus}` : ""}`
-    ),
+  listHosts: (caMigrationStatus?: CaMigrationStatus, includeDecommissioned = false) => {
+    const query = new URLSearchParams();
+    if (caMigrationStatus) query.set("ca_migration_status", caMigrationStatus);
+    if (includeDecommissioned) query.set("include_decommissioned", "true");
+    const qs = query.toString();
+    return request<HostOut[]>(`/hosts${qs ? `?${qs}` : ""}`);
+  },
   registerHost: (body: {
     hostname: string;
     ip_address: string;
     os_family: string;
     os_version?: string;
     tier?: number;
+    ssh_user?: string;
+    ssh_password?: string;
   }) => request<HostOut>("/hosts", { method: "POST", body: JSON.stringify(body) }),
+  // Partial update — chỉ field có mặt mới bị đổi. `tier` chỉ admin sửa được
+  // (backend 403 nếu không phải admin) — UI không tự ẩn field theo role,
+  // cùng quy ước RBAC 100% phía backend đã dùng xuyên suốt app này.
+  // ssh_password: "" xoá password đã lưu, undefined (không truyền) giữ nguyên.
+  updateHost: (
+    hostname: string,
+    body: {
+      ip_address?: string; os_family?: string; os_version?: string; tier?: number;
+      ssh_user?: string; ssh_password?: string;
+    }
+  ) =>
+    request<HostOut>(`/hosts/${encodeURIComponent(hostname)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  // Admin-only phía backend, tự ghi audit mỗi lần gọi — xem app/hosts.py.
+  getSshCredential: (hostname: string) =>
+    request<HostSshCredentialOut>(`/hosts/${encodeURIComponent(hostname)}/ssh-credential`),
+  // Hard-delete, admin-only, CHỈ thành công nếu host chưa từng chạy job nào
+  // (409 nếu đã có lịch sử — dùng updateHostDecommission thay vào đó).
+  deleteHost: (hostname: string) =>
+    request<void>(`/hosts/${encodeURIComponent(hostname)}`, { method: "DELETE" }),
   updateHostMigrationStatus: (hostname: string, ca_migration_status: CaMigrationStatus) =>
     request<HostOut>(`/hosts/${encodeURIComponent(hostname)}/ca-migration-status`, {
       method: "PATCH",
       body: JSON.stringify({ ca_migration_status }),
     }),
-  triggerScan: (hostname: string, scap_profile_key: string, ssh_user: string) =>
+  // Ngừng/khôi phục quản lý host — KHÔNG xoá record (xem app/hosts.py).
+  updateHostDecommission: (hostname: string, decommissioned: boolean) =>
+    request<HostOut>(`/hosts/${encodeURIComponent(hostname)}/decommission`, {
+      method: "PATCH",
+      body: JSON.stringify({ decommissioned }),
+    }),
+  // ssh_user KHÔNG còn là tham số request — dùng thẳng Host.ssh_user phía
+  // backend (xem app/schemas.py:ScanTrigger).
+  triggerScan: (hostname: string, scap_profile_key: string) =>
     request<JobOut>(`/hosts/${encodeURIComponent(hostname)}/scan`, {
       method: "POST",
-      body: JSON.stringify({ scap_profile_key, ssh_user }),
+      body: JSON.stringify({ scap_profile_key }),
     }),
+  // Chỉ khả thi cho host đã trust_deployed/migrated — xem app/jobs.py:trigger_ssh_check.
+  testSshReachability: (hostname: string) =>
+    request<JobOut>(`/hosts/${encodeURIComponent(hostname)}/ssh-check`, { method: "POST" }),
+  // Credential CŨ chỉ dùng ĐÚNG 1 LẦN cho request này, KHÔNG lưu lại ở phía
+  // client (component tự xoá state ngay sau khi gọi xong) lẫn server — xem
+  // app/jobs.py:trigger_ca_bootstrap. Chỉ khả thi khi host còn "not_started".
+  bootstrapCaTrust: (
+    hostname: string,
+    body: { legacy_ssh_user: string; legacy_ssh_password?: string; legacy_ssh_private_key?: string }
+  ) =>
+    request<JobOut>(`/hosts/${encodeURIComponent(hostname)}/bootstrap-ca-trust`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  // Script gộp sẵn (provision.sh + 2 systemd unit + token + ca-root.crt) để
+  // operator tự dán vào phiên SSH của chính họ — Orchestrator KHÔNG tự SSH
+  // hộ, xem app/agents.py:create_agent_install_script. Giữ làm phương án dự
+  // phòng cho host chưa qua CA trust hoặc chưa có bundle nào được ký — xem
+  // installAgent bên dưới cho đường tự động.
+  createAgentInstallScript: (hostname: string) =>
+    request<AgentInstallScriptOut>(
+      `/hosts/${encodeURIComponent(hostname)}/agent-install-script`,
+      { method: "POST" }
+    ),
+  // Remote-deploy tự động — Orchestrator tự SSH bằng cert ephemeral + scp
+  // bundle agent đã ký, không cần operator tự thực thi gì. Chỉ khả thi cho
+  // host đã trust_deployed/migrated VÀ đã có bundle được ký (xem
+  // app/agents.py:trigger_agent_install).
+  installAgent: (hostname: string) =>
+    request<JobOut>(`/hosts/${encodeURIComponent(hostname)}/agent-install`, { method: "POST" }),
   getJob: (jobId: number) => request<JobOut>(`/jobs/${jobId}`),
+  // "1-click restore" (break-glass) — khôi phục từ backup đã chụp lúc 1 job
+  // remediate-apply đã succeeded (app/jobs.py:run_restore). KHÔNG cần
+  // dry-run/four-eyes riêng, xem docstring backend.
+  restoreHost: (hostname: string, sourceJobId: number) =>
+    request<JobOut>(`/hosts/${encodeURIComponent(hostname)}/restore`, {
+      method: "POST",
+      body: JSON.stringify({ source_job_id: sourceJobId }),
+    }),
   listJobs: (params: {
     hostname?: string;
     job_type?: string;

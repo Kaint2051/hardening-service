@@ -33,6 +33,7 @@ import hmac
 import os
 from datetime import datetime, timezone
 
+import httpx
 import jwt as pyjwt
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy.orm import Session
@@ -43,15 +44,17 @@ from app.ca_client import (
     create_agent_enrollment_token,
     mint_agent_client_cert,
     mint_agent_manager_server_cert,
+    mint_ssh_certificate,
 )
 from app.config import settings
 from app.db import SessionLocal
-from app.jobs import _truncate_backup_b64
+from app.jobs import _call_job_dispatcher, _truncate_backup_b64
 from app.models import AgentEnrollmentToken, AgentFimEvent, Host, Job, RemediationVariant
 from app.schemas import (
     AgentEnrollmentTokenOut,
     AgentFimEventRequest,
     AgentHeartbeatRequest,
+    AgentInstallScriptOut,
     AgentRemediateClaimRequest,
     AgentRemediateClaimResponse,
     AgentRemediateResultRequest,
@@ -60,6 +63,7 @@ from app.schemas import (
     AgentScanResultRequest,
     AgentVerifyEnrollRequest,
     AgentVerifyEnrollResponse,
+    JobOut,
 )
 
 router = APIRouter(tags=["agents"])
@@ -73,6 +77,18 @@ def _get_db():
         yield db
     finally:
         db.close()
+
+
+def _require_active_host(db: Session, hostname: str) -> Host:
+    """Dùng chung cho create_enrollment_token/create_agent_install_script —
+    cả 2 đều là điểm bắt đầu enrollment Agent mới, không có lý do enroll host
+    đã decommission (xem app/hosts.py:update_decommission)."""
+    host = db.get(Host, hostname)
+    if host is None:
+        raise HTTPException(status_code=404, detail="host không tồn tại")
+    if host.decommissioned_at is not None:
+        raise HTTPException(status_code=422, detail="host đã decommission — recommission trước khi enroll agent")
+    return host
 
 
 def _check_agent_manager_auth(authorization: str | None) -> None:
@@ -113,19 +129,16 @@ def agent_manager_server_cert(
     return AgentVerifyEnrollResponse(cert_pem=cert_pem, key_pem=key_pem, ca_root_pem=ca_root_pem)
 
 
-@router.post(
-    "/hosts/{hostname}/agent-enrollment-tokens",
-    response_model=AgentEnrollmentTokenOut,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_enrollment_token(
-    hostname: str,
-    db: Session = Depends(_get_db),
-    user: CurrentUser = Depends(require_roles(*_OPERATOR_ROLES)),
+def _issue_agent_enrollment_token(
+    db: Session, hostname: str, user: CurrentUser
 ) -> AgentEnrollmentTokenOut:
-    if db.get(Host, hostname) is None:
-        raise HTTPException(status_code=404, detail="host không tồn tại")
+    """Sinh + lưu sổ sách 1 bootstrap token OTT mới cho `hostname` — dùng
+    chung bởi endpoint trả token thô (create_enrollment_token) và endpoint
+    sinh script cài đặt gộp sẵn (create_agent_install_script bên dưới), để
+    logic lưu jti/expires_at/audit không bao giờ lệch nhau giữa 2 đường.
 
+    Raises HTTPException(502) nếu step-ca từ chối cấp.
+    """
     try:
         token = create_agent_enrollment_token(hostname)
     except RuntimeError as exc:
@@ -154,6 +167,311 @@ def create_enrollment_token(
         payload={"expires_at": expires_at.isoformat()},
     )
     return AgentEnrollmentTokenOut(hostname=hostname, token=token, expires_at=expires_at)
+
+
+@router.post(
+    "/hosts/{hostname}/agent-enrollment-tokens",
+    response_model=AgentEnrollmentTokenOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_enrollment_token(
+    hostname: str,
+    db: Session = Depends(_get_db),
+    user: CurrentUser = Depends(require_roles(*_OPERATOR_ROLES)),
+) -> AgentEnrollmentTokenOut:
+    _require_active_host(db, hostname)
+    return _issue_agent_enrollment_token(db, hostname, user)
+
+
+def _build_agent_install_script(hostname: str, token: str, ca_root_pem: str) -> str:
+    """Sinh script bash cài Agent hoàn chỉnh cho `hostname`, gộp provision.sh
+    + 2 systemd unit file có sẵn (mount read-only từ apps/agent/, xem
+    docker-compose.yml) với token/ca-root vừa cấp riêng cho lần gọi này —
+    operator chỉ cần dán 1 lần vào phiên SSH CỦA CHÍNH HỌ tới máy đích.
+
+    Cố tình KHÔNG để Orchestrator tự SSH/push script này hộ — giữ đúng
+    nguyên tắc "không standing RCE console->fleet" (mục 4.2/4.3
+    architecture-proposal.md): operator vẫn là người thực thi trên máy đích,
+    console chỉ chuẩn bị sẵn nội dung. Cũng KHÔNG tự tải/copy binary
+    agent/executor — vẫn phải scp thủ công trước (xem apps/agent/README.md),
+    vì dự án chưa có nơi phân phối binary đã build; script chỉ kiểm tra tồn
+    tại + báo lỗi rõ ràng nếu thiếu, không âm thầm bỏ qua.
+
+    Raises OSError nếu không đọc được 1 trong 3 file asset (mount thiếu).
+    """
+    assets_dir = settings.agent_assets_dir
+    with open(os.path.join(assets_dir, "provision.sh"), encoding="utf-8") as f:
+        provision_sh = f.read()
+    with open(os.path.join(assets_dir, "hardening-agent.service"), encoding="utf-8") as f:
+        agent_unit = f.read()
+    with open(os.path.join(assets_dir, "hardening-executor.service"), encoding="utf-8") as f:
+        executor_unit = f.read()
+
+    # hardening-agent.service mặc định AGENT_MANAGER_URL=https://localhost:8443
+    # (chỉ đúng khi Agent Manager chạy CÙNG máy) — ghi agent.env với địa chỉ
+    # THẬT nếu đã cấu hình settings.agent_manager_public_url, tránh lặp lại
+    # lỗi "cài xong nhưng không bao giờ enroll" đã gặp thật (xem
+    # app/agents.py:trigger_agent_install). Nếu CHƯA cấu hình, giữ hành vi cũ
+    # (operator tự tạo agent.env — xem apps/agent/README.md).
+    agent_env_block = ""
+    if settings.agent_manager_public_url:
+        agent_env_block = f"""cat > /etc/hardening-agent/agent.env <<'AGENT_ENV_EOF_9f21'
+AGENT_MANAGER_URL={settings.agent_manager_public_url}
+AGENT_HOSTNAME={hostname}
+AGENT_ENV_EOF_9f21
+chown hardening-agent:hardening-agent /etc/hardening-agent/agent.env
+chmod 644 /etc/hardening-agent/agent.env
+"""
+
+    return f"""#!/usr/bin/env bash
+# Script cai Agent tu sinh cho host "{hostname}" -- DAN VAO PHIEN SSH CUA
+# CHINH BAN toi may dich roi chay bang root. KHONG phai Orchestrator tu SSH
+# ho -- xem apps/agent/README.md. Chua bootstrap token DUNG 1 LAN, het han
+# nhanh -- khong luu lai, khong chia se voi ai khac.
+set -euo pipefail
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "LOI: phai chay bang root (sudo)." >&2
+  exit 1
+fi
+
+for bin in /opt/hardening-agent/agent /opt/hardening-agent/executor/executor; do
+  if [[ ! -x "$bin" ]]; then
+    echo "LOI: thieu $bin -- scp binary da build (./build.sh) len may nay TRUOC khi chay script nay, xem apps/agent/README.md." >&2
+    exit 1
+  fi
+done
+
+echo "==> Buoc 1/4: provision user/group/thu muc"
+{provision_sh}
+
+echo "==> Buoc 2/4: ghi bootstrap token + ca-root.crt"
+umask 077
+cat > /etc/hardening-agent/enroll-token <<'AGENT_TOKEN_EOF_9f21'
+{token}
+AGENT_TOKEN_EOF_9f21
+cat > /etc/hardening-agent/ca-root.crt <<'AGENT_CAROOT_EOF_9f21'
+{ca_root_pem}
+AGENT_CAROOT_EOF_9f21
+chown hardening-agent:hardening-agent /etc/hardening-agent/enroll-token /etc/hardening-agent/ca-root.crt
+chmod 600 /etc/hardening-agent/enroll-token
+chmod 644 /etc/hardening-agent/ca-root.crt
+{agent_env_block}
+echo "==> Buoc 3/4: cai 2 systemd unit"
+cat > /etc/systemd/system/hardening-agent.service <<'AGENT_UNIT_EOF_9f21'
+{agent_unit}
+AGENT_UNIT_EOF_9f21
+cat > /etc/systemd/system/hardening-executor.service <<'EXECUTOR_UNIT_EOF_9f21'
+{executor_unit}
+EXECUTOR_UNIT_EOF_9f21
+
+echo "==> Buoc 4/4: khoi dong hardening-agent (Reporter)"
+systemctl daemon-reload
+systemctl enable hardening-agent.service
+systemctl restart hardening-agent.service
+
+echo "Reporter da chay -- xem: journalctl -u hardening-agent -f"
+echo "Executor (Active Response) CHUA duoc bat tu dong -- tao truoc"
+echo "/etc/hardening-agent/executor.env (EXECUTOR_TRUSTED_SIGNER_FINGERPRINT=...)"
+echo "roi chay tay: systemctl enable --now hardening-executor.service"
+"""
+
+
+@router.post(
+    "/hosts/{hostname}/agent-install-script",
+    response_model=AgentInstallScriptOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_agent_install_script(
+    hostname: str,
+    db: Session = Depends(_get_db),
+    user: CurrentUser = Depends(require_roles(*_OPERATOR_ROLES)),
+) -> AgentInstallScriptOut:
+    _require_active_host(db, hostname)
+
+    token_out = _issue_agent_enrollment_token(db, hostname, user)
+
+    with open(settings.stepca_root_cert_path, encoding="utf-8") as f:
+        ca_root_pem = f.read()
+
+    try:
+        script = _build_agent_install_script(hostname, token_out.token, ca_root_pem)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "không đọc được asset cài Agent (provision.sh/systemd unit) "
+                f"— kiểm tra mount agent_assets_dir trong docker-compose.yml: {exc}"
+            ),
+        ) from exc
+
+    write_audit_event(
+        actor=user.username,
+        action="agent_install_script_generated",
+        resource=hostname,
+        payload={"expires_at": token_out.expires_at.isoformat()},
+    )
+    return AgentInstallScriptOut(hostname=hostname, expires_at=token_out.expires_at, script=script)
+
+
+def _parse_agent_install_summary(logs: str) -> dict:
+    # Chỉ đọc dòng AGENT_INSTALL_STATUS do agent-install.sh in ra — KHÔNG bao
+    # giờ đưa token/ca-root vào summary (script tự nó cũng không echo lại,
+    # xem apps/execution-env/agent-install.sh).
+    summary = {"raw_log_tail": logs[-2000:]}
+    for line in logs.splitlines():
+        if "=" not in line or not line.startswith("AGENT_INSTALL_"):
+            continue
+        key, _, value = line.partition("=")
+        summary[key.strip().lower()] = value.strip()
+    return summary
+
+
+@router.post(
+    "/hosts/{hostname}/agent-install", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED
+)
+def trigger_agent_install(
+    hostname: str,
+    db: Session = Depends(_get_db),
+    user: CurrentUser = Depends(require_roles(*_OPERATOR_ROLES)),
+) -> Job:
+    """Remote-deploy Agent tự động — KHÁC create_agent_install_script (dán
+    tay): tự SSH bằng cert ephemeral (đúng cơ chế trigger_ssh_check,
+    app/jobs.py), scp binary agent+executor đã ký qua content-signing +
+    provision.sh + 2 systemd unit, chạy cài đặt ngay trên máy đích — operator
+    không cần tự thực thi gì (xem apps/execution-env/agent-install.sh).
+
+    Chỉ khả thi cho host ĐÃ trust_deployed/migrated (cần SSH bằng cert
+    ephemeral được, giống trigger_ssh_check) — KHÔNG cần legacy credential
+    nào (khác trigger_ca_bootstrap, vốn chạy TRƯỚC khi CA trust tồn tại).
+    Cần settings.agent_bundle_ref + settings.agent_bundle_trusted_fingerprint đã
+    cấu hình (trỏ tới bundle đã ký qua đúng quy trình 3 vai trò, xem
+    scripts/content-signing/README.md + apps/agent/README.md mục đóng gói) —
+    vẫn giữ create_agent_install_script làm phương án dự phòng cho host chưa
+    qua CA trust hoặc khi chưa có bundle nào được ký. agent_bundle_trusted_fingerprint
+    CỐ Ý tách khỏi content_signing_trusted_fingerprint (dùng cho remediation)
+    — đổi 1 bên không ảnh hưởng verify của bên còn lại, xem app/config.py.
+
+    Mọi bước chuẩn bị (mint cert, issue token, đọc ca-root) đều bọc try/except
+    RIÊNG, tự đánh Job "failed" trước khi raise lại — tránh lớp bug "Job kẹt
+    vĩnh viễn ở status running" đã từng gặp (xem docstring mint_ssh_certificate/
+    _call_job_dispatcher), vì hàm này (khác create_agent_install_script) tạo
+    Job row TRƯỚC khi làm các bước có thể lỗi.
+    """
+    host = _require_active_host(db, hostname)
+
+    if host.ca_migration_status not in ("trust_deployed", "migrated"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "host chưa deploy CA trust (ca_migration_status phải là "
+                "trust_deployed hoặc migrated) — chạy Zero-to-CA Migration "
+                "playbook hoặc bootstrap-ca-trust trước"
+            ),
+        )
+    if host.ssh_user not in settings.allowed_ssh_users_set:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"ssh_user hiện tại của host ('{host.ssh_user}') không còn nằm trong "
+                f"allowlist ({sorted(settings.allowed_ssh_users_set)}) — sửa lại qua PATCH /hosts/{{hostname}}"
+            ),
+        )
+    if not settings.agent_bundle_ref or not settings.agent_bundle_trusted_fingerprint:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "chưa cấu hình AGENT_BUNDLE_REF/AGENT_BUNDLE_TRUSTED_FINGERPRINT — ký 1 "
+                "bundle agent qua scripts/content-signing/{pull,review,sign}.sh trước, xem "
+                "apps/agent/README.md mục đóng gói bundle"
+            ),
+        )
+    if not settings.agent_manager_public_url:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "chưa cấu hình AGENT_MANAGER_PUBLIC_URL — thiếu biến này Agent cài xong "
+                "sẽ KHÔNG enroll được trên host khác máy Agent Manager, xem app/config.py"
+            ),
+        )
+
+    job = Job(
+        hostname=hostname,
+        job_type="agent-install",
+        status="running",
+        triggered_by=user.username,
+        started_at=datetime.now(timezone.utc),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    def _fail(error_tag: str, detail: str, http_status: int, cause: Exception) -> None:
+        job.status = "failed"
+        job.result_summary = {"error": error_tag}
+        job.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        write_audit_event(
+            actor=user.username, action="agent_install_failed", resource=hostname,
+            payload={"job_id": job.id, "error": error_tag},
+        )
+        raise HTTPException(status_code=http_status, detail=detail) from cause
+
+    try:
+        private_key, cert_pub = mint_ssh_certificate(principal=host.ssh_user)
+    except RuntimeError as exc:
+        _fail("ca_mint_failed", f"không cấp được SSH cert cho job: {exc}", 502, exc)
+
+    try:
+        token_out = _issue_agent_enrollment_token(db, hostname, user)
+    except HTTPException as exc:
+        _fail("enrollment_token_issue_failed", exc.detail, 502, exc)
+
+    try:
+        with open(settings.stepca_root_cert_path, encoding="utf-8") as f:
+            ca_root_pem = f.read()
+    except OSError as exc:
+        _fail("ca_root_read_failed", f"không đọc được CA root cert: {exc}", 500, exc)
+
+    dispatch_body = {
+        "job_id": str(job.id),
+        "image": settings.allowed_execution_image,
+        "command": ["agent-install"],
+        "environment": {
+            "TARGET_HOST": host.ip_address,
+            "SSH_USER": host.ssh_user,
+            "SSH_KEY_B64": base64.b64encode(private_key.encode()).decode(),
+            "SSH_CERT_B64": base64.b64encode(cert_pub.encode()).decode(),
+            "AGENT_HOSTNAME": host.hostname,
+            "AGENT_BUNDLE_REF": settings.agent_bundle_ref,
+            "AGENT_BUNDLE_TRUSTED_FINGERPRINT": settings.agent_bundle_trusted_fingerprint,
+            "AGENT_ENROLL_TOKEN_B64": base64.b64encode(token_out.token.encode()).decode(),
+            "CA_ROOT_PEM_B64": base64.b64encode(ca_root_pem.encode()).decode(),
+            "AGENT_MANAGER_PUBLIC_URL": settings.agent_manager_public_url,
+        },
+        "timeout_seconds": 120,
+    }
+
+    try:
+        result = _call_job_dispatcher(dispatch_body, timeout=150)
+    except httpx.HTTPError as exc:
+        _fail("dispatcher_call_failed", f"job-dispatcher lỗi: {exc}", 502, exc)
+
+    summary = _parse_agent_install_summary(result.get("logs", ""))
+    summary["exit_code"] = result.get("exit_code")
+    job.status = "succeeded" if result.get("exit_code") == 0 else "failed"
+    job.result_summary = summary
+    job.finished_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(job)
+
+    write_audit_event(
+        actor=user.username,
+        action="agent_install_completed",
+        resource=hostname,
+        payload={"job_id": job.id, "status": job.status},
+    )
+    return job
 
 
 @router.post("/internal/agent/verify-and-enroll", response_model=AgentVerifyEnrollResponse)

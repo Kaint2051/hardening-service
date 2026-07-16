@@ -65,6 +65,8 @@ export interface HostOut {
   os_family: string;
   os_version: string | null;
   tier: number;
+  ssh_user: string;
+  has_ssh_password: boolean;
   ca_migration_status: CaMigrationStatus;
   ca_migration_updated_by: string | null;
   added_by: string;
@@ -72,12 +74,26 @@ export interface HostOut {
   updated_at: string;
   agent_enrolled_at: string | null;
   agent_last_seen: string | null;
+  decommissioned_at: string | null;
+  decommissioned_by: string | null;
 }
 
 export interface AgentEnrollmentTokenOut {
   hostname: string;
   token: string;
   expires_at: string;
+}
+
+export interface AgentInstallScriptOut {
+  hostname: string;
+  expires_at: string;
+  script: string;
+}
+
+export interface HostSshCredentialOut {
+  hostname: string;
+  ssh_user: string;
+  ssh_password: string | null;
 }
 
 // Khớp app/schemas.py:JobListOut — GET /jobs (list) CỐ Ý không có
@@ -147,5 +163,8 @@ export const SCAP_PROFILE_KEYS = [
 // job_type/status thật sự được gán trong app/jobs.py + app/agents.py — chỉ
 // dùng làm option cho dropdown lọc ở JobsPage, KHÔNG phải enum backend enforce
 // (GET /jobs nhận bất kỳ chuỗi nào, không khớp gì trả về rỗng chứ không 422).
-export const JOB_TYPES = ["scan", "agent-scan", "remediate-dry-run", "remediate-apply", "restore"] as const;
+export const JOB_TYPES = [
+  "scan", "agent-scan", "remediate-dry-run", "remediate-apply", "restore", "ssh-check", "ca-bootstrap",
+  "agent-install",
+] as const;
 export const JOB_STATUSES = ["pending", "running", "succeeded", "failed"] as const;
