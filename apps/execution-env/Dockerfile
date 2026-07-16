@@ -37,17 +37,22 @@ RUN pip install --no-cache-dir --break-system-packages ansible-runner==2.4.0
 
 WORKDIR /runner
 
-# Cho phép build image "chỉ scan" (KHÔNG có khả năng remediate) mà không cần
-# chờ commit hash đã review — scan qua OpenSCAP không cần các role bên dưới,
-# chỉ remediate mới cần. Mặc định build (không truyền build-arg) vẫn giữ
-# nguyên hành vi cũ: BẮT BUỘC cài role, và BẮT BUỘC FAIL nếu requirements.yml
-# còn placeholder (đã verify thật — xem apps/execution-env/README.md).
+# Cho phép build image "chỉ scan" (KHÔNG có khả năng remediate) — scan qua
+# OpenSCAP không cần collection bên dưới, chỉ remediate mới cần. Mặc định
+# build (không truyền build-arg) cài collection devsec.hardening (đã review +
+# ghim commit thật, xem requirements.yml — KHÔNG còn placeholder). Dùng
+# "collection install" (không phải "role install" cũ) vì dev-sec đã
+# deprecate 2 role standalone, merge chung vào 1 collection duy nhất — role
+# trong playbook.yml giờ gọi qua FQCN devsec.hardening.os_hardening/
+# devsec.hardening.ssh_hardening. Cài vào /usr/share/ansible/collections —
+# 1 trong các path mặc định ansible-playbook tự tìm collection (khác
+# /etc/ansible/roles cho role kiểu cũ), không cần khai thêm ansible.cfg.
 ARG INSTALL_REMEDIATION_ROLES=true
 COPY requirements.yml .
 RUN if [ "$INSTALL_REMEDIATION_ROLES" = "true" ]; then \
-        ansible-galaxy role install -r requirements.yml -p /etc/ansible/roles; \
+        ansible-galaxy collection install -r requirements.yml -p /usr/share/ansible/collections; \
     else \
-        echo "SKIP: remediation roles KHONG duoc cai (INSTALL_REMEDIATION_ROLES=false)."; \
+        echo "SKIP: remediation collection KHONG duoc cai (INSTALL_REMEDIATION_ROLES=false)."; \
         echo "Image nay CHI dung de scan, KHONG dung de remediate."; \
     fi
 

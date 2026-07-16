@@ -2,16 +2,31 @@
 # tránh supply-chain attack qua kênh cập nhật role cộng đồng (mục 4.2 và rủi ro
 # "Ansible Control Node..." trong architecture-proposal.md).
 #
-# ⚠️ CÁC GIÁ TRỊ "version" DƯỚI ĐÂY LÀ PLACEHOLDER — CHƯA ĐƯỢC REVIEW/GHIM.
-# Trước khi build image thật:
-#   1. Reviewer đọc toàn bộ diff của role tại commit dự kiến dùng.
-#   2. Ghi commit hash đầy đủ (40 ký tự) vào "version" bên dưới.
-#   3. Đi qua quy trình 3 vai trò trong scripts/content-signing/ trước khi
-#      coi image build ra là đáng tin để chạy trên production.
-roles:
-  - name: dev-sec.os-hardening
-    src: https://github.com/dev-sec/ansible-os-hardening.git
-    version: "REPLACE_WITH_REVIEWED_COMMIT_SHA"
-  - name: dev-sec.ssh-hardening
-    src: https://github.com/dev-sec/ansible-ssh-hardening.git
-    version: "REPLACE_WITH_REVIEWED_COMMIT_SHA"
+# dev-sec/ansible-os-hardening và dev-sec/ansible-ssh-hardening (2 role
+# standalone dùng trước đây) đã bị chính dev-sec deprecate — ssh-hardening
+# archived từ 2020 (đóng băng ~6 năm, README ghi rõ "migrated to
+# hardening-collection"), os-hardening bị merge chung vào collection mới.
+# Pin vào collection thống nhất devsec.hardening (còn maintain thật, push
+# gần nhất chỉ vài ngày trước lúc review) THAY VÌ 2 role cũ đã bị bỏ rơi
+# vĩnh viễn — role name đổi thành devsec.hardening.os_hardening/
+# devsec.hardening.ssh_hardening trong playbook.yml (khác tên role cũ).
+#
+# Đã review trước khi ghim (không phải placeholder):
+#   - os_hardening: ~140 setting sysctl/PAM/SUID-SGID/mount-option/UFW/auditd,
+#     KHÔNG có task nào tải nội dung từ mạng ngoài package manager hệ thống.
+#     Task xoá SUID/SGID có cờ os_security_suid_sgid_remove_from_unknown mặc
+#     định false (an toàn, không tự strip suid khỏi binary lạ) — GIỮ NGUYÊN
+#     mặc định này, không override trong playbook.yml.
+#   - ssh_hardening: mặc định tắt root login + tắt password auth (bắt buộc
+#     publickey) — RỦI RO TỰ KHOÁ SSH nếu máy đích CHƯA có sẵn user sudo +
+#     public key hoạt động, role không tự kiểm tra điều kiện này trước khi
+#     áp dụng. Bắt buộc xác nhận đủ điều kiện trên máy đích TRƯỚC khi chạy
+#     bất kỳ playbook nào include role này (đúng nguyên tắc control Nhóm B
+#     "cấm canary trực tiếp, test lab trước" — mục 4.5 architecture-proposal.md).
+#     Có validate `sshd -T` trước khi ghi đè config, không sợ lỗi cú pháp làm
+#     sshd không start được — chỉ sợ thiếu key hợp lệ trước khi áp dụng.
+#   - Không GitHub Security Advisory/CVE nào cho cả 2 tại thời điểm review.
+collections:
+  - name: https://github.com/dev-sec/ansible-collection-hardening.git
+    type: git
+    version: f5a6c4b652eca494e5ece586b45677ecfb0feec8  # tag 10.6.0, 2026-05-26

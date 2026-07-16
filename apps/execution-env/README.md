@@ -34,18 +34,24 @@ trống — biết fingerprint nào đáng tin (biến môi trường) là chưa
 CHÍNH public key đó nằm trong keyring mới verify được. Bake public key vào
 IMAGE lúc build (`Dockerfile` tự `gpg --import`), cùng tinh thần
 `requirements.yml` pin theo commit hash, thay vì truyền qua biến môi trường
-runtime. File này hiện là **placeholder** — `gpg --import` sẽ thất bại lúc
-build (không chặn build, chỉ in cảnh báo) khiến `remediate.sh` **từ chối MỌI
-bundle** cho tới khi Signer xuất public key thật thay vào (xem hướng dẫn
-trong chính file `trusted-signer-pubkey.asc`) — an toàn mặc định, không phải
-thiếu sót.
+runtime. File hiện có 1 key THẬT (`agent-signer`, dùng cho
+`AGENT_BUNDLE_TRUSTED_FINGERPRINT` — xem `apps/agent/README.md` mục đóng gói
+bundle Agent) — **KHÔNG phải Signer cho remediation content**. `remediate.sh`
+verify theo `CONTENT_SIGNING_TRUSTED_FINGERPRINT` (biến RIÊNG, đã tách khỏi
+`AGENT_BUNDLE_TRUSTED_FINGERPRINT` — xem `app/config.py`), fingerprint này
+hiện KHÔNG có key tương ứng trong file → `remediate.sh` vẫn **từ chối MỌI
+bundle remediation** cho tới khi làm xong mục A dưới đây (an toàn mặc định,
+không phải thiếu sót). `gpg --import` chấp nhận nhiều key trong 1 file —
+thêm key remediation Signer vào CUỐI file này (không xoá key agent-signer
+đang có).
 
 **2 cơ chế phân phối nội dung KHÁC NHAU, đừng nhầm lẫn**:
-- `requirements.yml` (dưới đây) — role hardening CHUNG, bake sẵn vào image
-  lúc build (`/etc/ansible/roles`), pin theo commit hash đã review.
+- `requirements.yml` (dưới đây) — collection hardening CHUNG (`devsec.hardening`),
+  bake sẵn vào image lúc build (`/usr/share/ansible/collections`), pin theo
+  commit hash đã review.
 - `scripts/content-signing/signed/<ref>/playbook.yml` — nội dung CỤ THỂ
-  theo từng job/Control, ký + mount riêng, có thể `include_role` tới role ở
-  trên.
+  theo từng job/Control, ký + mount riêng, `include_role` tới role FQCN ở
+  trên (vd `devsec.hardening.os_hardening`).
 
 ## Trước khi dùng thật
 
@@ -74,19 +80,29 @@ thể chịu trách nhiệm, không phải 1 bước kỹ thuật có thể tự
    giống cách đã verify E2E trước đây) qua đúng `pull.sh → review.sh → sign.sh`,
    chạy `remediate.sh` dry-run xác nhận `verified:true` đúng fingerprint.
 
-### B. Review + ghim Ansible role thật (`requirements.yml`)
+### B. Review + ghim Ansible role thật (`requirements.yml`) — ĐÃ XONG
 
-1. Reviewer đọc toàn bộ diff của `dev-sec.os-hardening`/`dev-sec.ssh-hardening`
-   tại đúng commit dự kiến dùng (không tin tag/branch, tự đọc code — supply
-   chain risk đã ghi trong `docs/architecture-proposal.md` mục 4.2).
-2. Ghi đầy đủ 40 ký tự commit SHA vào `version:` cho từng role.
-3. Build với `--build-arg INSTALL_REMEDIATION_ROLES=true` (mặc định `false`)
-   để thực sự cài role vào image — trước đó mọi lần build/test chỉ dùng
-   `false` nên bước này CHƯA từng chạy thật.
-4. Verify: build không dừng ở lỗi `pathspec ... did not match` (dấu hiệu vẫn
-   còn placeholder), và `docker run <image> ansible-galaxy role list` thấy
-   đúng 2 role + version đã ghim.
-5. Commit `requirements.yml` (giá trị version không bí mật).
+Review thật đã thực hiện (không phải placeholder nữa) — 2 phát hiện quan
+trọng lúc review, đọc kỹ trước khi động vào `requirements.yml`:
+
+1. `dev-sec/ansible-os-hardening` và `dev-sec/ansible-ssh-hardening` (2 role
+   standalone dùng trong bản đề xuất gốc) **đã bị chính dev-sec deprecate** —
+   `ssh-hardening` archived từ 2020 (đóng băng ~6 năm), `os-hardening` bị
+   merge vào 1 collection chung. Đã pin vào collection kế thừa còn maintain
+   thật: `devsec.hardening` (`https://github.com/dev-sec/ansible-collection-hardening`,
+   tag `10.6.0`, commit `f5a6c4b652eca494e5ece586b45677ecfb0feec8`).
+2. **Tên role đổi khác hoàn toàn** khi viết `playbook.yml` cho bundle
+   remediation: `devsec.hardening.os_hardening` /
+   `devsec.hardening.ssh_hardening` (FQCN có namespace, không phải
+   `dev-sec.os-hardening` cũ) — role cài bằng
+   `ansible-galaxy collection install` vào `/usr/share/ansible/collections`
+   (path mặc định ansible-playbook tự tìm collection), KHÔNG còn ở
+   `/etc/ansible/roles` như trước.
+
+Kết quả review chi tiết (không có gì đáng ngại, nhưng 1 điểm PHẢI nhớ trước
+khi dùng `ssh_hardening`) — xem comment đầy đủ trong `requirements.yml`.
+Build xác nhận thật: `docker run <image> ansible-doc -t role -l | grep devsec`
+thấy đúng `devsec.hardening.os_hardening`/`ssh_hardening`.
 
 ### C. Ký bundle remediation thật đầu tiên
 
@@ -119,7 +135,7 @@ nhất vượt `MAX_ARG_STRLEN` (131072 byte) của kernel Linux nên được c
 nhiều biến `BACKUP_TAR_B64_{i}` (xem `RESTORE_CHUNK_SIZE` trong
 `app/jobs.py`), `restore.sh` ghép lại trước khi giải nén. Từ chối restore
 (422, không âm thầm khôi phục 1 phần) nếu backup nguồn bị `backup_truncated`.
-Chưa có nút bấm Web UI (chỉ API) — xem README gốc.
+Đã có nút "Restore" trên trang Jobs (Web UI), không chỉ API.
 
 ## Đã verify (lab server, Ubuntu 24.04)
 
