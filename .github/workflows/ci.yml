@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Chỉ giữ đúng quyền cần thiết cho GITHUB_TOKEN mặc định của workflow này
+# (checkout công khai, không cần ghi gì) — nguyên tắc least-privilege, hợp
+# lý cho 1 dự án hardening tự áp chuẩn cho chính mình.
+permissions:
+  contents: read
+
+# Hủy các lần chạy CI cũ hơn trên cùng branch/PR khi có push mới — tránh tốn
+# runner-minutes chạy CI cho commit đã lỗi thời.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  orchestrator:
+    name: orchestrator (alembic + pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # .env.example đã có sẵn placeholder "changeme" cho mọi secret bắt
+      # buộc (app/config.py:_reject_empty_required_secrets từ chối chuỗi
+      # rỗng) — đủ để build/test, KHÔNG cần secret thật vì CI không kết nối
+      # ra Keycloak/step-ca thật nào.
+      - name: Chuẩn bị .env từ .env.example
+        run: cp .env.example .env
+
+      - name: Build image postgres + orchestrator
+        run: docker compose build postgres orchestrator
+
+      - name: Khởi động postgres, chờ healthy
+        run: |
+          docker compose up -d postgres
+          timeout 60 sh -c 'until docker compose ps postgres | grep -q "(healthy)"; do sleep 2; done'
+
+      # Chạy migration lên 1 Postgres thật (không phải SQLite trong test) —
+      # bắt lỗi thứ tự/nội dung migration sớm, đúng loại lỗi từng gặp thật ở
+      # đợt cutover RBAC (migration 0026).
+      - name: alembic upgrade head
+        run: docker compose run --rm -e PYTHONPATH=/app orchestrator alembic upgrade head
+
+      - name: pytest
+        run: docker compose run --rm -e PYTHONPATH=/app orchestrator pytest -q
+
+      - name: Dọn container/network
+        if: always()
+        run: docker compose down -v
+
+  job-dispatcher:
+    name: job-dispatcher (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # job-dispatcher là service duy nhất giữ quyền Docker (mount
+      # docker.sock) nên image production được giữ tối thiểu, không có
+      # pytest sẵn — chạy test suite trong container Python dùng tạm, đúng
+      # quy ước đã ghi trong CLAUDE.md.
+      - name: pytest trong container tạm
+        run: |
+          docker run --rm -v "$(pwd)/apps/job-dispatcher:/src" -w /src python:3.12-slim \
+            sh -c "pip install -q -r requirements.txt pytest && pytest -q"
+
+  agent:
+    name: agent + executor (go test + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: go test ./...
+        run: docker run --rm -v "$(pwd)/apps/agent:/src" -w /src golang:1.22-alpine go test ./...
+
+      - name: build agent (Reporter) binary tĩnh linux/amd64
+        run: bash apps/agent/build.sh
+
+      - name: build executor binary tĩnh linux/amd64
+        run: bash apps/agent/executor/build.sh
+
+  agent-manager:
+    name: agent-manager (go test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Chuẩn bị .env từ .env.example
+        run: cp .env.example .env
+
+      - name: Build image
+        run: docker compose build agent-manager
+
+      - name: go test ./...
+        run: docker run --rm -v "$(pwd)/apps/agent-manager:/src" -w /src golang:1.22-alpine go test ./...
+
+  web:
+    name: web (tsc + vite build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Chuẩn bị .env từ .env.example
+        run: cp .env.example .env
+
+      # Dockerfile chạy `tsc && vite build` trong lúc build image — build
+      # fail ngay nếu có lỗi type, không cần bước riêng.
+      - name: Build image (tsc && vite build)
+        run: docker compose build web
+
+  execution-env:
+    name: execution-env image build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # KHÔNG phải service trong docker-compose.yml — job-dispatcher gọi qua
+      # `docker run` thẳng bằng tag trong ALLOWED_EXECUTION_IMAGE, build
+      # riêng đúng như CLAUDE.md đã ghi.
+      - name: Build image
+        run: docker build -t hardening-console-execution-env:latest ./apps/execution-env
