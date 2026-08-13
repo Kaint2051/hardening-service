@@ -34,11 +34,26 @@ jobs:
       - name: Build image postgres + orchestrator
         run: docker compose build postgres orchestrator
 
-      - name: Khởi động postgres, chờ healthy
+      # step-ca mới init CHỈ có provisioner "orchestrator" mặc định — THIẾU
+      # provisioner "agent-enrollment" mà test_agents.py's agent-install cần
+      # (gọi step-ca THẬT, không mock ở layer này). Trên lab, provisioner đó
+      # được tạo 1 LẦN DUY NHẤT lúc mới dựng và lưu vĩnh viễn trong volume
+      # step-ca-data — CI mỗi lần chạy là step-ca hoàn toàn mới nên phải tạo
+      # lại. Thiếu bước này -> 3 test agent-install FAIL 502
+      # "enrollment_token_issue_failed" (xác nhận qua log CI thật).
+      - name: Khởi động step-ca, chờ healthy
         run: |
-          docker compose up -d postgres
-          timeout 60 sh -c 'until docker compose ps postgres | grep -q "(healthy)"; do sleep 2; done'
+          docker compose up -d step-ca
+          cid=$(docker compose ps -q step-ca)
+          timeout 60 sh -c "until [ \"\$(docker inspect -f '{{.State.Health.Status}}' $cid)\" = healthy ]; do sleep 2; done"
 
+      - name: Thiết lập provisioner step-ca (agent-enrollment)
+        run: bash infra/step-ca/setup-provisioners.sh
+
+      # postgres không cần chờ health riêng — orchestrator's depends_on
+      # (condition: service_healthy cho cả postgres và step-ca) tự khiến
+      # `docker compose run` chờ đúng thứ cần chờ trước khi chạy.
+      #
       # Chạy migration lên 1 Postgres thật (không phải SQLite trong test) —
       # bắt lỗi thứ tự/nội dung migration sớm, đúng loại lỗi từng gặp thật ở
       # đợt cutover RBAC (migration 0026).
@@ -60,12 +75,14 @@ jobs:
 
       # job-dispatcher là service duy nhất giữ quyền Docker (mount
       # docker.sock) nên image production được giữ tối thiểu, không có
-      # pytest sẵn — chạy test suite trong container Python dùng tạm, đúng
-      # quy ước đã ghi trong CLAUDE.md.
+      # pytest sẵn — chạy test suite trong container Python dùng tạm. httpx
+      # KHÔNG có trong requirements.txt production (chỉ starlette.testclient
+      # cần lúc test) — thiếu là collection lỗi ngay, xem docstring đầu
+      # tests/test_main.py (CLAUDE.md thiếu gói này, đã xác nhận qua CI thật).
       - name: pytest trong container tạm
         run: |
           docker run --rm -v "$(pwd)/apps/job-dispatcher:/src" -w /src python:3.12-slim \
-            sh -c "pip install -q -r requirements.txt pytest && pytest -q"
+            sh -c "pip install -q -r requirements.txt pytest httpx && python -m pytest tests/ -v"
 
   agent:
     name: agent + executor (go test + build)
