@@ -1,0 +1,3082 @@
+---
+###############################################################################
+# CURATED SUBSET cua Ansible Playbook chinh thuc do ComplianceAsCode sinh ra
+# cho profile xccdf_org.ssgproject.content_profile_cis_level1_server (CIS
+# Ubuntu Linux 22.04 LTS Benchmark v2.0.0, Level 1 Server) -- nguon:
+# https://github.com/ComplianceAsCode/content release v0.1.81 (sha512 da
+# verify khop cong bo chinh thuc).
+#
+# CHI giu lai: 1 task "Gather the package facts" bat buoc (nhieu task khac
+# phu thuoc bien ansible_facts.packages tu day, tag "always" trong ban goc)
+# + cac rule lien quan SSH (dong 18076-21281 cua file goc) -- KHONG sua doi
+# noi dung cac task duoc giu (nguyen van tu ban chinh thuc, ke ca ten
+# task/tags/mo ta).
+#
+# LOAI BO 1 rule: 'Disable SSH Root Login' (tag sshd_disable_root_login) --
+# rule nay ghi cung 'PermitRootLogin no' (khong co bien de chinh, khac cac
+# rule khac trong file). He thong nay SSH vao bang ROOT qua cert CA ngan han
+# (remediate-apply/restore luon cung SSH_USER=root, xem app/jobs.py) -- ap
+# 'PermitRootLogin no' se tu khoa vinh vien kenh ma chinh he thong dung de
+# quan ly host do. Se bo sung lai rule nay (voi gia tri prohibit-password
+# hoac tuong duong) sau khi xac nhan co phuong an cuu ho ngoai bang thong
+# (out-of-band recovery) cho host do -- dung nguyen tac Nhom B, muc 4.5/4.6
+# docs/architecture-proposal.md.
+###############################################################################
+- name: Ansible Playbook for xccdf_org.ssgproject.content_profile_cis_level1_server
+  hosts: all
+  vars:
+    var_sudo_logfile: /var/log/sudo.log
+    var_sudo_timestamp_timeout: '15'
+    cis_banner_text: Authorized users only. All activity may be monitored and reported.
+    var_password_pam_dcredit: '-1'
+    var_password_pam_dictcheck: '1'
+    var_password_pam_difok: '2'
+    var_password_pam_lcredit: '-1'
+    var_password_pam_maxrepeat: '3'
+    var_password_pam_maxsequence: '3'
+    var_password_pam_minclass: '4'
+    var_password_pam_minlen: '14'
+    var_password_pam_ocredit: '-1'
+    var_password_pam_ucredit: '-1'
+    var_password_hashing_algorithm_pam: yescrypt
+    var_account_disable_post_pw_expiration: '45'
+    var_pam_wheel_group_for_su: sugroup
+    var_accounts_tmout: '900'
+    var_user_initialization_files_regex: ^\.[\w\- ]+$
+    var_accounts_user_umask: '027'
+    var_network_filtering_service: nftables
+    sysctl_net_ipv6_conf_all_accept_ra_value: '0'
+    sysctl_net_ipv6_conf_all_accept_redirects_value: '0'
+    sysctl_net_ipv6_conf_all_accept_source_route_value: '0'
+    sysctl_net_ipv6_conf_all_forwarding_value: '0'
+    sysctl_net_ipv6_conf_default_accept_ra_value: '0'
+    sysctl_net_ipv6_conf_default_accept_redirects_value: '0'
+    sysctl_net_ipv6_conf_default_accept_source_route_value: '0'
+    sysctl_net_ipv4_conf_all_accept_redirects_value: '0'
+    sysctl_net_ipv4_conf_all_accept_source_route_value: '0'
+    sysctl_net_ipv4_conf_all_log_martians_value: '1'
+    sysctl_net_ipv4_conf_all_rp_filter_value: '1'
+    sysctl_net_ipv4_conf_all_secure_redirects_value: '0'
+    sysctl_net_ipv4_conf_default_accept_redirects_value: '0'
+    sysctl_net_ipv4_conf_default_accept_source_route_value: '0'
+    sysctl_net_ipv4_conf_default_log_martians_value: '1'
+    sysctl_net_ipv4_conf_default_rp_filter_value: '1'
+    sysctl_net_ipv4_conf_default_secure_redirects_value: '0'
+    sysctl_net_ipv4_icmp_echo_ignore_broadcasts_value: '1'
+    sysctl_net_ipv4_icmp_ignore_bogus_error_responses_value: '1'
+    sysctl_net_ipv4_tcp_syncookies_value: '1'
+    var_nftables_table: filter
+    var_nftables_family: inet
+    var_nftables_base_chain_names: input,forward,output
+    var_nftables_base_chain_types: filter,filter,filter
+    var_nftables_base_chain_hooks: input,forward,output
+    var_nftables_base_chain_priorities: 0,0,0
+    var_nftables_base_chain_policies: accept,accept,accept
+    var_timesync_service: systemd-timesyncd
+    var_multiple_time_servers: time.nist.gov,time-a-g.nist.gov,time-b-g.nist.gov,time-c-g.nist.gov
+    var_multiple_time_pools: time.nist.gov
+    var_sshd_set_keepalive: '3'
+    sshd_idle_timeout_value: '300'
+    var_sshd_set_login_grace_time: '60'
+    sshd_max_auth_tries_value: '4'
+    var_sshd_max_sessions: '10'
+    var_sshd_set_maxstartups: 10:30:60
+    sshd_strong_kex: curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group14-sha256
+    sshd_strong_macs: hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+  tasks:
+  - name: Gather the package facts
+    ansible.builtin.package_facts:
+      manager: auto
+    tags:
+    - always
+
+  - name: Set the file_groupowner_sshd_config_newgroup variable if represented by
+      gid
+    ansible.builtin.set_fact:
+      file_groupowner_sshd_config_newgroup: '0'
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_groupowner_sshd_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Test for existence /etc/ssh/sshd_config
+    ansible.builtin.stat:
+      path: /etc/ssh/sshd_config
+    register: file_exists
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_groupowner_sshd_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Ensure group owner on /etc/ssh/sshd_config
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config
+      follow: false
+      group: '{{ file_groupowner_sshd_config_newgroup }}'
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - file_exists.stat is defined and file_exists.stat.exists
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_groupowner_sshd_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Set the file_groupowner_sshd_drop_in_config_newgroup variable if represented
+      by gid
+    ansible.builtin.set_fact:
+      file_groupowner_sshd_drop_in_config_newgroup: '0'
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_groupowner_sshd_drop_in_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Find /etc/ssh/sshd_config.d/ file(s) matching ^.*$
+    ansible.builtin.command: find -P /etc/ssh/sshd_config.d/ -maxdepth 1 -type f  !
+      -group 0 -regextype posix-extended -regex "^.*$"
+    register: files_found
+    changed_when: false
+    failed_when: false
+    check_mode: false
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_groupowner_sshd_drop_in_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Ensure group owner on /etc/ssh/sshd_config.d/ file(s) matching ^.*$
+    ansible.builtin.file:
+      path: '{{ item }}'
+      follow: false
+      group: '{{ file_groupowner_sshd_drop_in_config_newgroup }}'
+      state: file
+    with_items:
+    - '{{ files_found.stdout_lines }}'
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_groupowner_sshd_drop_in_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Set the file_owner_sshd_config_newown variable if represented by uid
+    ansible.builtin.set_fact:
+      file_owner_sshd_config_newown: '0'
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_owner_sshd_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Test for existence /etc/ssh/sshd_config
+    ansible.builtin.stat:
+      path: /etc/ssh/sshd_config
+    register: file_exists
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_owner_sshd_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Ensure owner on /etc/ssh/sshd_config
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config
+      follow: false
+      owner: '{{ file_owner_sshd_config_newown }}'
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - file_exists.stat is defined and file_exists.stat.exists
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_owner_sshd_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Set the file_owner_sshd_drop_in_config_newown variable if represented by
+      uid
+    ansible.builtin.set_fact:
+      file_owner_sshd_drop_in_config_newown: '0'
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_owner_sshd_drop_in_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Find /etc/ssh/sshd_config.d/ file(s) matching ^.*$
+    ansible.builtin.command: find -P /etc/ssh/sshd_config.d/ -maxdepth 1 -type f  !
+      -user 0 -regextype posix-extended -regex "^.*$"
+    register: files_found
+    changed_when: false
+    failed_when: false
+    check_mode: false
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_owner_sshd_drop_in_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Ensure owner on /etc/ssh/sshd_config.d/ file(s) matching ^.*$
+    ansible.builtin.file:
+      path: '{{ item }}'
+      follow: false
+      owner: '{{ file_owner_sshd_drop_in_config_newown }}'
+      state: file
+    with_items:
+    - '{{ files_found.stdout_lines }}'
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_owner_sshd_drop_in_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Test for existence /etc/ssh/sshd_config
+    ansible.builtin.stat:
+      path: /etc/ssh/sshd_config
+    register: file_exists
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - configure_strategy
+    - file_permissions_sshd_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Ensure permission u-xs,g-xwrs,o-xwrt on /etc/ssh/sshd_config
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config
+      mode: u-xs,g-xwrs,o-xwrt
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - file_exists.stat is defined and file_exists.stat.exists
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - configure_strategy
+    - file_permissions_sshd_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Find /etc/ssh/sshd_config.d/ file(s)
+    ansible.builtin.command: find -P /etc/ssh/sshd_config.d/ -maxdepth 1 -perm /u+xs,g+xwrs,o+xwrt  -type
+      f -regextype posix-extended -regex "^.*$"
+    register: files_found
+    changed_when: false
+    failed_when: false
+    check_mode: false
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_permissions_sshd_drop_in_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Set permissions for /etc/ssh/sshd_config.d/ file(s)
+    ansible.builtin.file:
+      path: '{{ item }}'
+      mode: u-xs,g-xwrs,o-xwrt
+      state: file
+    with_items:
+    - '{{ files_found.stdout_lines }}'
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - configure_strategy
+    - file_permissions_sshd_drop_in_config
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Find root:root-owned keys
+    ansible.builtin.command: find -H /etc/ssh/ -maxdepth 1 -user root -regex ".*_key$"
+      -type f -group root -perm /u+xs,g+xwrs,o+xwrt
+    register: root_owned_keys
+    changed_when: false
+    failed_when: false
+    check_mode: false
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-171-3.1.13
+    - NIST-800-171-3.13.10
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - configure_strategy
+    - file_permissions_sshd_private_key
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Set permissions for root:root-owned keys
+    ansible.builtin.file:
+      path: '{{ item }}'
+      mode: u-xs,g-xwrs,o-xwrt
+      state: file
+    with_items:
+    - '{{ root_owned_keys.stdout_lines }}'
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-171-3.1.13
+    - NIST-800-171-3.13.10
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - configure_strategy
+    - file_permissions_sshd_private_key
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Find /etc/ssh/ file(s)
+    ansible.builtin.command: find -P /etc/ssh/ -maxdepth 1 -perm /u+xs,g+xws,o+xwt  -type
+      f -regextype posix-extended -regex "^.*\.pub$"
+    register: files_found
+    changed_when: false
+    failed_when: false
+    check_mode: false
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-171-3.1.13
+    - NIST-800-171-3.13.10
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - configure_strategy
+    - file_permissions_sshd_pub_key
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Set permissions for /etc/ssh/ file(s)
+    ansible.builtin.file:
+      path: '{{ item }}'
+      mode: u-xs,g-xws,o-xwt
+      state: file
+    with_items:
+    - '{{ files_found.stdout_lines }}'
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-171-3.1.13
+    - NIST-800-171-3.13.10
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-6(1)
+    - NIST-800-53-CM-6(a)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - configure_strategy
+    - file_permissions_sshd_pub_key
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+
+  - name: Set SSH Client Alive Count Max - Check if the parameter ClientAliveCountMax
+      is configured in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "ClientAliveCountMax"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255030
+    - NIST-800-171-3.1.11
+    - NIST-800-53-AC-12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-2(5)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-SC-10
+    - PCI-DSS-Req-8.1.8
+    - PCI-DSSv4-8.2
+    - PCI-DSSv4-8.2.8
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_keepalive
+
+  - name: Set SSH Client Alive Count Max - Check if the parameter ClientAliveCountMax
+      is configured in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "ClientAliveCountMax"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255030
+    - NIST-800-171-3.1.11
+    - NIST-800-53-AC-12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-2(5)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-SC-10
+    - PCI-DSS-Req-8.1.8
+    - PCI-DSSv4-8.2
+    - PCI-DSSv4-8.2.8
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_keepalive
+
+  - name: Set SSH Client Alive Count Max - Check if the parameter ClientAliveCountMax
+      is configured correctly in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "ClientAliveCountMax"| regex_escape }}\s+{{ var_sshd_set_keepalive
+        }}$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255030
+    - NIST-800-171-3.1.11
+    - NIST-800-53-AC-12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-2(5)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-SC-10
+    - PCI-DSS-Req-8.1.8
+    - PCI-DSSv4-8.2
+    - PCI-DSSv4-8.2.8
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_keepalive
+
+  - name: Set SSH Client Alive Count Max - Check if the parameter ClientAliveCountMax
+      is configured correctly in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "ClientAliveCountMax"| regex_escape }}\s+{{ var_sshd_set_keepalive
+        }}$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255030
+    - NIST-800-171-3.1.11
+    - NIST-800-53-AC-12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-2(5)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-SC-10
+    - PCI-DSS-Req-8.1.8
+    - PCI-DSSv4-8.2
+    - PCI-DSSv4-8.2.8
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_keepalive
+
+  - name: Set SSH Client Alive Count Max
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "ClientAliveCountMax"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter ClientAliveCountMax is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "ClientAliveCountMax"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "ClientAliveCountMax"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "ClientAliveCountMax"| regex_escape }}\s+
+        line: ClientAliveCountMax {{ var_sshd_set_keepalive }}
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255030
+    - NIST-800-171-3.1.11
+    - NIST-800-53-AC-12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-2(5)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-SC-10
+    - PCI-DSS-Req-8.1.8
+    - PCI-DSSv4-8.2
+    - PCI-DSSv4-8.2.8
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_keepalive
+
+  - name: Set SSH Client Alive Count Max - set file mode for /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255030
+    - NIST-800-171-3.1.11
+    - NIST-800-53-AC-12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-2(5)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-SC-10
+    - PCI-DSS-Req-8.1.8
+    - PCI-DSSv4-8.2
+    - PCI-DSSv4-8.2.8
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_keepalive
+
+  - name: Set SSH Client Alive Interval - Check if the parameter ClientAliveInterval
+      is configured in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "ClientAliveInterval"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255035
+    - NIST-800-171-3.1.11
+    - NIST-800-53-AC-12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-2(5)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-SC-10
+    - PCI-DSS-Req-8.1.8
+    - PCI-DSSv4-8.2
+    - PCI-DSSv4-8.2.8
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_idle_timeout
+
+  - name: Set SSH Client Alive Interval - Check if the parameter ClientAliveInterval
+      is configured in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "ClientAliveInterval"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255035
+    - NIST-800-171-3.1.11
+    - NIST-800-53-AC-12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-2(5)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-SC-10
+    - PCI-DSS-Req-8.1.8
+    - PCI-DSSv4-8.2
+    - PCI-DSSv4-8.2.8
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_idle_timeout
+
+  - name: Set SSH Client Alive Interval - Check if the parameter ClientAliveInterval
+      is configured correctly in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "ClientAliveInterval"| regex_escape }}\s+{{ sshd_idle_timeout_value
+        }}$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255035
+    - NIST-800-171-3.1.11
+    - NIST-800-53-AC-12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-2(5)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-SC-10
+    - PCI-DSS-Req-8.1.8
+    - PCI-DSSv4-8.2
+    - PCI-DSSv4-8.2.8
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_idle_timeout
+
+  - name: Set SSH Client Alive Interval - Check if the parameter ClientAliveInterval
+      is configured correctly in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "ClientAliveInterval"| regex_escape }}\s+{{ sshd_idle_timeout_value
+        }}$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255035
+    - NIST-800-171-3.1.11
+    - NIST-800-53-AC-12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-2(5)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-SC-10
+    - PCI-DSS-Req-8.1.8
+    - PCI-DSSv4-8.2
+    - PCI-DSSv4-8.2.8
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_idle_timeout
+
+  - name: Set SSH Client Alive Interval
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "ClientAliveInterval"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter ClientAliveInterval is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "ClientAliveInterval"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "ClientAliveInterval"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "ClientAliveInterval"| regex_escape }}\s+
+        line: ClientAliveInterval {{ sshd_idle_timeout_value }}
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255035
+    - NIST-800-171-3.1.11
+    - NIST-800-53-AC-12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-2(5)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-SC-10
+    - PCI-DSS-Req-8.1.8
+    - PCI-DSSv4-8.2
+    - PCI-DSSv4-8.2.8
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_idle_timeout
+
+  - name: Set SSH Client Alive Interval - set file mode for /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255035
+    - NIST-800-171-3.1.11
+    - NIST-800-53-AC-12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-2(5)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-SC-10
+    - PCI-DSS-Req-8.1.8
+    - PCI-DSSv4-8.2
+    - PCI-DSSv4-8.2.8
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_idle_timeout
+
+  - name: Disable Host-Based Authentication - Check if the parameter HostbasedAuthentication
+      is configured in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "HostbasedAuthentication"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-3
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSSv4-8.3
+    - PCI-DSSv4-8.3.1
+    - disable_host_auth
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+
+  - name: Disable Host-Based Authentication - Check if the parameter HostbasedAuthentication
+      is configured in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "HostbasedAuthentication"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-3
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSSv4-8.3
+    - PCI-DSSv4-8.3.1
+    - disable_host_auth
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+
+  - name: Disable Host-Based Authentication - Check if the parameter HostbasedAuthentication
+      is configured correctly in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "HostbasedAuthentication"| regex_escape }}\s+no$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-3
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSSv4-8.3
+    - PCI-DSSv4-8.3.1
+    - disable_host_auth
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+
+  - name: Disable Host-Based Authentication - Check if the parameter HostbasedAuthentication
+      is configured correctly in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "HostbasedAuthentication"| regex_escape }}\s+no$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-3
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSSv4-8.3
+    - PCI-DSSv4-8.3.1
+    - disable_host_auth
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+
+  - name: Disable Host-Based Authentication
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "HostbasedAuthentication"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter HostbasedAuthentication is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "HostbasedAuthentication"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "HostbasedAuthentication"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "HostbasedAuthentication"| regex_escape }}\s+
+        line: HostbasedAuthentication no
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - CJIS-5.5.6
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-3
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSSv4-8.3
+    - PCI-DSSv4-8.3.1
+    - disable_host_auth
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+
+  - name: Disable Host-Based Authentication - set file mode for /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-3
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSSv4-8.3
+    - PCI-DSSv4-8.3.1
+    - disable_host_auth
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+
+  - name: Disable SSH Access via Empty Passwords - Check if the parameter PermitEmptyPasswords
+      is configured in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "PermitEmptyPasswords"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255025
+    - NIST-800-171-3.1.1
+    - NIST-800-171-3.1.5
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - high_severity
+    - low_complexity
+    - low_disruption
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_disable_empty_passwords
+
+  - name: Disable SSH Access via Empty Passwords - Check if the parameter PermitEmptyPasswords
+      is configured in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "PermitEmptyPasswords"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255025
+    - NIST-800-171-3.1.1
+    - NIST-800-171-3.1.5
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - high_severity
+    - low_complexity
+    - low_disruption
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_disable_empty_passwords
+
+  - name: Disable SSH Access via Empty Passwords - Check if the parameter PermitEmptyPasswords
+      is configured correctly in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "PermitEmptyPasswords"| regex_escape }}\s+no$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255025
+    - NIST-800-171-3.1.1
+    - NIST-800-171-3.1.5
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - high_severity
+    - low_complexity
+    - low_disruption
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_disable_empty_passwords
+
+  - name: Disable SSH Access via Empty Passwords - Check if the parameter PermitEmptyPasswords
+      is configured correctly in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "PermitEmptyPasswords"| regex_escape }}\s+no$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255025
+    - NIST-800-171-3.1.1
+    - NIST-800-171-3.1.5
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - high_severity
+    - low_complexity
+    - low_disruption
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_disable_empty_passwords
+
+  - name: Disable SSH Access via Empty Passwords
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "PermitEmptyPasswords"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter PermitEmptyPasswords is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "PermitEmptyPasswords"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "PermitEmptyPasswords"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "PermitEmptyPasswords"| regex_escape }}\s+
+        line: PermitEmptyPasswords no
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255025
+    - NIST-800-171-3.1.1
+    - NIST-800-171-3.1.5
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - high_severity
+    - low_complexity
+    - low_disruption
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_disable_empty_passwords
+
+  - name: Disable SSH Access via Empty Passwords - set file mode for /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255025
+    - NIST-800-171-3.1.1
+    - NIST-800-171-3.1.5
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - high_severity
+    - low_complexity
+    - low_disruption
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_disable_empty_passwords
+
+  - name: Disable SSH Support for .rhosts Files - Check if the parameter IgnoreRhosts
+      is configured in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "IgnoreRhosts"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_disable_rhosts
+
+  - name: Disable SSH Support for .rhosts Files - Check if the parameter IgnoreRhosts
+      is configured in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "IgnoreRhosts"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_disable_rhosts
+
+  - name: Disable SSH Support for .rhosts Files - Check if the parameter IgnoreRhosts
+      is configured correctly in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "IgnoreRhosts"| regex_escape }}\s+yes$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_disable_rhosts
+
+  - name: Disable SSH Support for .rhosts Files - Check if the parameter IgnoreRhosts
+      is configured correctly in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "IgnoreRhosts"| regex_escape }}\s+yes$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_disable_rhosts
+
+  - name: Disable SSH Support for .rhosts Files
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "IgnoreRhosts"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter IgnoreRhosts is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "IgnoreRhosts"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "IgnoreRhosts"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "IgnoreRhosts"| regex_escape }}\s+
+        line: IgnoreRhosts yes
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - CJIS-5.5.6
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_disable_rhosts
+
+  - name: Disable SSH Support for .rhosts Files - set file mode for /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_disable_rhosts
+
+
+  - name: Do Not Allow SSH Environment Options - Check if the parameter PermitUserEnvironment
+      is configured in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "PermitUserEnvironment"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255025
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_do_not_permit_user_env
+
+  - name: Do Not Allow SSH Environment Options - Check if the parameter PermitUserEnvironment
+      is configured in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "PermitUserEnvironment"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255025
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_do_not_permit_user_env
+
+  - name: Do Not Allow SSH Environment Options - Check if the parameter PermitUserEnvironment
+      is configured correctly in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "PermitUserEnvironment"| regex_escape }}\s+no$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255025
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_do_not_permit_user_env
+
+  - name: Do Not Allow SSH Environment Options - Check if the parameter PermitUserEnvironment
+      is configured correctly in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "PermitUserEnvironment"| regex_escape }}\s+no$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255025
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_do_not_permit_user_env
+
+  - name: Do Not Allow SSH Environment Options
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "PermitUserEnvironment"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter PermitUserEnvironment is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "PermitUserEnvironment"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "PermitUserEnvironment"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "PermitUserEnvironment"| regex_escape }}\s+
+        line: PermitUserEnvironment no
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255025
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_do_not_permit_user_env
+
+  - name: Do Not Allow SSH Environment Options - set file mode for /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255025
+    - NIST-800-171-3.1.12
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - NIST-800-53-CM-7(a)
+    - NIST-800-53-CM-7(b)
+    - PCI-DSS-Req-2.2.4
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_do_not_permit_user_env
+
+  - name: Enable PAM - Check if the parameter UsePAM is configured in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "UsePAM"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - DISA-STIG-UBTU-22-255065
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_enable_pam
+
+  - name: Enable PAM - Check if the parameter UsePAM is configured in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "UsePAM"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - DISA-STIG-UBTU-22-255065
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_enable_pam
+
+  - name: Enable PAM - Check if the parameter UsePAM is configured correctly in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "UsePAM"| regex_escape }}\s+yes$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - DISA-STIG-UBTU-22-255065
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_enable_pam
+
+  - name: Enable PAM - Check if the parameter UsePAM is configured correctly in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "UsePAM"| regex_escape }}\s+yes$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - DISA-STIG-UBTU-22-255065
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_enable_pam
+
+  - name: Enable PAM
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "UsePAM"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter UsePAM is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "UsePAM"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "UsePAM"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "UsePAM"| regex_escape }}\s+
+        line: UsePAM yes
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - DISA-STIG-UBTU-22-255065
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_enable_pam
+
+  - name: Enable PAM - set file mode for /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - DISA-STIG-UBTU-22-255065
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_enable_pam
+
+  - name: Enable SSH Warning Banner - Check if the parameter Banner is configured
+      in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "Banner"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255020
+    - NIST-800-171-3.1.9
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-8(a)
+    - NIST-800-53-AC-8(c)
+    - NIST-800-53-CM-6(a)
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_enable_warning_banner_net
+
+  - name: Enable SSH Warning Banner - Check if the parameter Banner is configured
+      in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "Banner"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255020
+    - NIST-800-171-3.1.9
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-8(a)
+    - NIST-800-53-AC-8(c)
+    - NIST-800-53-CM-6(a)
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_enable_warning_banner_net
+
+  - name: Enable SSH Warning Banner - Check if the parameter Banner is configured
+      correctly in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "Banner"| regex_escape }}\s+/etc/issue.net$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255020
+    - NIST-800-171-3.1.9
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-8(a)
+    - NIST-800-53-AC-8(c)
+    - NIST-800-53-CM-6(a)
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_enable_warning_banner_net
+
+  - name: Enable SSH Warning Banner - Check if the parameter Banner is configured
+      correctly in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "Banner"| regex_escape }}\s+/etc/issue.net$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255020
+    - NIST-800-171-3.1.9
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-8(a)
+    - NIST-800-53-AC-8(c)
+    - NIST-800-53-CM-6(a)
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_enable_warning_banner_net
+
+  - name: Enable SSH Warning Banner
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "Banner"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter Banner is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "Banner"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "Banner"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "Banner"| regex_escape }}\s+
+        line: Banner /etc/issue.net
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255020
+    - NIST-800-171-3.1.9
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-8(a)
+    - NIST-800-53-AC-8(c)
+    - NIST-800-53-CM-6(a)
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_enable_warning_banner_net
+
+  - name: Enable SSH Warning Banner - set file mode for /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - CJIS-5.5.6
+    - DISA-STIG-UBTU-22-255020
+    - NIST-800-171-3.1.9
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-AC-8(a)
+    - NIST-800-53-AC-8(c)
+    - NIST-800-53-CM-6(a)
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_enable_warning_banner_net
+
+  - name: Ensure SSH LoginGraceTime is configured - Check if the parameter LoginGraceTime
+      is configured in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "LoginGraceTime"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_login_grace_time
+
+  - name: Ensure SSH LoginGraceTime is configured - Check if the parameter LoginGraceTime
+      is configured in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "LoginGraceTime"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_login_grace_time
+
+  - name: Ensure SSH LoginGraceTime is configured - Check if the parameter LoginGraceTime
+      is configured correctly in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "LoginGraceTime"| regex_escape }}\s+{{ var_sshd_set_login_grace_time
+        }}$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_login_grace_time
+
+  - name: Ensure SSH LoginGraceTime is configured - Check if the parameter LoginGraceTime
+      is configured correctly in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "LoginGraceTime"| regex_escape }}\s+{{ var_sshd_set_login_grace_time
+        }}$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_login_grace_time
+
+  - name: Ensure SSH LoginGraceTime is configured
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "LoginGraceTime"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter LoginGraceTime is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "LoginGraceTime"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "LoginGraceTime"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "LoginGraceTime"| regex_escape }}\s+
+        line: LoginGraceTime {{ var_sshd_set_login_grace_time }}
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_login_grace_time
+
+  - name: Ensure SSH LoginGraceTime is configured - set file mode for /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_login_grace_time
+
+  - name: Set LogLevel to INFO - Check if the parameter LogLevel is configured in
+      /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "LogLevel"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - low_complexity
+    - low_disruption
+    - low_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_loglevel_info
+
+  - name: Set LogLevel to INFO - Check if the parameter LogLevel is configured in
+      /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "LogLevel"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - low_complexity
+    - low_disruption
+    - low_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_loglevel_info
+
+  - name: Set LogLevel to INFO - Check if the parameter LogLevel is configured correctly
+      in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "LogLevel"| regex_escape }}\s+INFO$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - low_complexity
+    - low_disruption
+    - low_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_loglevel_info
+
+  - name: Set LogLevel to INFO - Check if the parameter LogLevel is configured correctly
+      in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "LogLevel"| regex_escape }}\s+INFO$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - low_complexity
+    - low_disruption
+    - low_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_loglevel_info
+
+  - name: Set LogLevel to INFO
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "LogLevel"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter LogLevel is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "LogLevel"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "LogLevel"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "LogLevel"| regex_escape }}\s+
+        line: LogLevel INFO
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - low_complexity
+    - low_disruption
+    - low_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_loglevel_info
+
+  - name: Set LogLevel to INFO - set file mode for /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/01-complianceascode-reinforce-os-defaults.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17(a)
+    - NIST-800-53-CM-6(a)
+    - low_complexity
+    - low_disruption
+    - low_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_loglevel_info
+
+  - name: Set SSH authentication attempt limit - Check if the parameter MaxAuthTries
+      is configured in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "MaxAuthTries"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_max_auth_tries
+
+  - name: Set SSH authentication attempt limit - Check if the parameter MaxAuthTries
+      is configured in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "MaxAuthTries"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_max_auth_tries
+
+  - name: Set SSH authentication attempt limit - Check if the parameter MaxAuthTries
+      is configured correctly in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "MaxAuthTries"| regex_escape }}\s+{{ sshd_max_auth_tries_value
+        }}$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_max_auth_tries
+
+  - name: Set SSH authentication attempt limit - Check if the parameter MaxAuthTries
+      is configured correctly in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "MaxAuthTries"| regex_escape }}\s+{{ sshd_max_auth_tries_value
+        }}$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_max_auth_tries
+
+  - name: Set SSH authentication attempt limit
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "MaxAuthTries"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter MaxAuthTries is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "MaxAuthTries"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "MaxAuthTries"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "MaxAuthTries"| regex_escape }}\s+
+        line: MaxAuthTries {{ sshd_max_auth_tries_value }}
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_max_auth_tries
+
+  - name: Set SSH authentication attempt limit - set file mode for /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_max_auth_tries
+
+  - name: Set SSH MaxSessions limit - Check if the parameter MaxSessions is configured
+      in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "MaxSessions"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_max_sessions
+
+  - name: Set SSH MaxSessions limit - Check if the parameter MaxSessions is configured
+      in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "MaxSessions"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_max_sessions
+
+  - name: Set SSH MaxSessions limit - Check if the parameter MaxSessions is configured
+      correctly in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "MaxSessions"| regex_escape }}\s+{{ var_sshd_max_sessions
+        }}$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_max_sessions
+
+  - name: Set SSH MaxSessions limit - Check if the parameter MaxSessions is configured
+      correctly in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "MaxSessions"| regex_escape }}\s+{{ var_sshd_max_sessions
+        }}$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_max_sessions
+
+  - name: Set SSH MaxSessions limit
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "MaxSessions"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter MaxSessions is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "MaxSessions"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "MaxSessions"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "MaxSessions"| regex_escape }}\s+
+        line: MaxSessions {{ var_sshd_max_sessions }}
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_max_sessions
+
+  - name: Set SSH MaxSessions limit - set file mode for /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_max_sessions
+
+  - name: Ensure SSH MaxStartups is configured - Check if the parameter MaxStartups
+      is configured in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "MaxStartups"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_maxstartups
+
+  - name: Ensure SSH MaxStartups is configured - Check if the parameter MaxStartups
+      is configured in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "MaxStartups"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_maxstartups
+
+  - name: Ensure SSH MaxStartups is configured - Check if the parameter MaxStartups
+      is configured correctly in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "MaxStartups"| regex_escape }}\s+{{ var_sshd_set_maxstartups
+        }}$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_maxstartups
+
+  - name: Ensure SSH MaxStartups is configured - Check if the parameter MaxStartups
+      is configured correctly in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "MaxStartups"| regex_escape }}\s+{{ var_sshd_set_maxstartups
+        }}$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_maxstartups
+
+  - name: Ensure SSH MaxStartups is configured
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "MaxStartups"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter MaxStartups is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "MaxStartups"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "MaxStartups"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "MaxStartups"| regex_escape }}\s+
+        line: MaxStartups {{ var_sshd_set_maxstartups }}
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_maxstartups
+
+  - name: Ensure SSH MaxStartups is configured - set file mode for /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.6
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_set_maxstartups
+
+  - name: Use Only Strong Key Exchange algorithms - Check if the parameter KexAlgorithms
+      is configured in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "KexAlgorithms"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSS-Req-2.3
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.7
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_use_strong_kex
+
+  - name: Use Only Strong Key Exchange algorithms - Check if the parameter KexAlgorithms
+      is configured in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "KexAlgorithms"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSS-Req-2.3
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.7
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_use_strong_kex
+
+  - name: Use Only Strong Key Exchange algorithms - Check if the parameter KexAlgorithms
+      is configured correctly in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "KexAlgorithms"| regex_escape }}\s+{{ sshd_strong_kex }}$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSS-Req-2.3
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.7
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_use_strong_kex
+
+  - name: Use Only Strong Key Exchange algorithms - Check if the parameter KexAlgorithms
+      is configured correctly in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "KexAlgorithms"| regex_escape }}\s+{{ sshd_strong_kex }}$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSS-Req-2.3
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.7
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_use_strong_kex
+
+  - name: Use Only Strong Key Exchange algorithms
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "KexAlgorithms"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter KexAlgorithms is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "KexAlgorithms"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "KexAlgorithms"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "KexAlgorithms"| regex_escape }}\s+
+        line: KexAlgorithms {{ sshd_strong_kex }}
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - PCI-DSS-Req-2.3
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.7
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_use_strong_kex
+
+  - name: Use Only Strong Key Exchange algorithms - set file mode for /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - PCI-DSS-Req-2.3
+    - PCI-DSSv4-2.2
+    - PCI-DSSv4-2.2.7
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_use_strong_kex
+
+  - name: Use Only Strong MACs - Check if the parameter MACs is configured in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "MACs"| regex_escape }}\s+
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17 (2)
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_use_strong_macs
+
+  - name: Use Only Strong MACs - Check if the parameter MACs is configured in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "MACs"| regex_escape }}\s+
+    register: _config_dir_has_parameter
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17 (2)
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_use_strong_macs
+
+  - name: Use Only Strong MACs - Check if the parameter MACs is configured correctly
+      in /etc/ssh/sshd_config
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: (?i)^\s*{{ "MACs"| regex_escape }}\s+{{ sshd_strong_macs }}$
+      state: absent
+    check_mode: true
+    changed_when: false
+    register: _config_file_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17 (2)
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_use_strong_macs
+
+  - name: Use Only Strong MACs - Check if the parameter MACs is configured correctly
+      in /etc/ssh/sshd_config.d
+    ansible.builtin.find:
+      paths:
+      - /etc/ssh/sshd_config.d
+      contains: (?i)^\s*{{ "MACs"| regex_escape }}\s+{{ sshd_strong_macs }}$
+    register: _config_dir_correctly
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17 (2)
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_use_strong_macs
+
+  - name: Use Only Strong MACs
+    block:
+
+    - name: Deduplicate values from /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        create: false
+        regexp: (?i)(?i)^\s*{{ "MACs"| regex_escape }}\s+
+        state: absent
+
+    - name: Check if /etc/ssh/sshd_config.d exists
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: _etc_ssh_sshd_config_d_exists
+
+    - name: Check if the parameter MACs is present in /etc/ssh/sshd_config.d
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        recurse: 'yes'
+        follow: 'no'
+        contains: (?i)^\s*{{ "MACs"| regex_escape }}\s+
+      register: _etc_ssh_sshd_config_d_has_parameter
+      when: _etc_ssh_sshd_config_d_exists.stat.isdir is defined and _etc_ssh_sshd_config_d_exists.stat.isdir
+
+    - name: Remove parameter from files in /etc/ssh/sshd_config.d
+      ansible.builtin.lineinfile:
+        path: '{{ item.path }}'
+        create: false
+        regexp: (?i)(?i)^\s*{{ "MACs"| regex_escape }}\s+
+        state: absent
+      with_items: '{{ _etc_ssh_sshd_config_d_has_parameter.files | default([]) }}'
+      when: _etc_ssh_sshd_config_d_has_parameter.matched > 0
+
+    - name: Insert correct line to /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+        create: true
+        regexp: (?i)(?i)^\s*{{ "MACs"| regex_escape }}\s+
+        line: MACs {{ sshd_strong_macs }}
+        state: present
+        insertbefore: BOF
+        validate: /usr/sbin/sshd -t -f %s
+    when:
+    - '"linux-base" in ansible_facts.packages'
+    - (_config_file_correctly.found == 0 and _config_dir_correctly.matched == 0) or
+      ((_config_file_has_parameter.found | int) + (_config_dir_has_parameter.matched
+      | int)) != 1
+    tags:
+    - NIST-800-53-AC-17 (2)
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_use_strong_macs
+
+  - name: Use Only Strong MACs - set file mode for /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+    ansible.builtin.file:
+      path: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+      mode: '0600'
+      state: touch
+      modification_time: preserve
+      access_time: preserve
+    when: '"linux-base" in ansible_facts.packages'
+    tags:
+    - NIST-800-53-AC-17 (2)
+    - low_complexity
+    - low_disruption
+    - medium_severity
+    - no_reboot_needed
+    - restrict_strategy
+    - sshd_use_strong_macs

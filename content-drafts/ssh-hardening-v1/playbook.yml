@@ -1,0 +1,42 @@
+---
+# DRAFT — CHƯA qua quy trình 3 vai trò (pull/review/sign), CHƯA được dùng
+# thật. Đây là bản soạn thử cho Control "ssh-hardening-v1" (đề xuất) để
+# Reviewer đọc trước khi quyết định có đưa vào scripts/content-signing/
+# hay không — xem apps/execution-env/README.md mục "Trước khi dùng thật".
+#
+# Nguồn: role devsec.hardening.ssh_hardening đã review + ghim tại
+# apps/execution-env/requirements.yml (commit f5a6c4b652eca494e5ece586b45677ecfb0feec8,
+# tag 10.6.0) — KHÔNG tự viết task SSH nào ở đây, chỉ gọi role + override
+# đúng 2 biến có rủi ro tự khoá kênh cho hệ thống NÀY cụ thể.
+#
+# TẠI SAO OVERRIDE ssh_permit_root_login (khác mặc định "no" của role):
+#   remediate-dry-run/remediate-apply (app/jobs.py) LUÔN cứng SSH_USER="root"
+#   khi kết nối tới host đích — KHÔNG theo Host.ssh_user (khác scan/ssh-check).
+#   Nếu áp mặc định "no" của role, NGAY LẦN remediate-apply ĐẦU TIÊN áp
+#   control này sẽ tự khoá vĩnh viễn kênh root mà chính Orchestrator dùng để
+#   scan/remediate/restore host đó — không có lỗi cú pháp (role có validate
+#   sshd -T trước khi ghi đè) nên sẽ KHÔNG bị chặn ở bước nào, tự làm đúng
+#   như thiết kế... của 1 hệ thống khác (giả định admin dùng sudo user riêng,
+#   không phải hệ thống này).
+#   "prohibit-password" (khác "yes" hoàn toàn mở, khác "no" tự khoá): vẫn
+#   CHẶN root login bằng PASSWORD (rủi ro thật, khớp mục tiêu hardening),
+#   chỉ GIỮ LẠI root login bằng publickey/certificate — đúng kênh cert CA
+#   ngắn hạn hệ thống này đang dùng (KHÁC static password/key, không mất đi
+#   nguyên tắc "no standing privilege" nào cả).
+#
+# TẠI SAO GIỮ ssh_server_password_login=false (mặc định role, KHÔNG override):
+#   Directive khác nhau trong sshd — PasswordAuthentication không ảnh hưởng
+#   PubkeyAuthentication/certificate — chặn hẳn password login toàn hệ thống
+#   không ảnh hưởng kênh cert đang dùng. An toàn giữ nguyên mặc định.
+#
+# XẾP LOẠI: risk_group "B" (đổi PAM/SSH — mục 4.5 architecture-proposal.md).
+#   BẮT BUỘC: dry-run (--check --diff, remediate.sh đã hỗ trợ sẵn) + test lab
+#   thật trên 1 host Tier thấp trước — CẤM canary/apply trực tiếp lên
+#   Tier 0/1 cho tới khi xác nhận out-of-band recovery (IPMI/iLO/serial) sẵn
+#   sàng cho host đó (mục 4.6 — CHƯA làm ở dự án này, xem README chính).
+- name: SSH hardening (devsec.hardening.ssh_hardening) — v1
+  hosts: all
+  vars:
+    ssh_permit_root_login: "prohibit-password"
+  roles:
+    - devsec.hardening.ssh_hardening
