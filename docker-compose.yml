@@ -105,24 +105,62 @@ services:
       timeout: 5s
       retries: 20
 
+  # Build riêng (infra/keycloak/Dockerfile) — thêm entrypoint wrapper tự lấy
+  # cert TLS qua Orchestrator lúc khởi động (mục "Dựng TLS thật", xem
+  # infra/keycloak/README.md) — trước đây dùng thẳng image gốc.
   keycloak:
-    image: quay.io/keycloak/keycloak:24.0
+    build: ./infra/keycloak
     restart: unless-stopped
-    command: start-dev --import-realm
+    # --http-enabled=false: Ý ĐỊNH là tắt hẳn cổng HTTP nội bộ (8080), mục
+    # tiêu của việc dựng TLS này là không còn đường plaintext nào — nhưng
+    # verify thật trên lab cho thấy `start-dev` LUÔN tự bật lại HTTP dù có
+    # cờ này (log khởi động in "Listening on: http://0.0.0.0:8080 and
+    # https://0.0.0.0:8443" bất kể flag) — hành vi cứng của Keycloak dev mode
+    # (đổi sang `start` production mode mới tắt được thật, kéo theo yêu cầu
+    # cấu hình khác đáng kể, ngoài phạm vi lần làm TLS này). CHẤP NHẬN ĐƯỢC
+    # vì cổng 8080 KHÔNG publish ra host (chỉ container khác trong mgmt-net
+    # gọi được, không lộ ra LAN) — giữ flag này để rõ Ý ĐỊNH + sẵn sàng có
+    # tác dụng thật nếu sau này đổi sang `start`.
+    command: start-dev --import-realm --http-enabled=false
+    # entrypoint-wrapper.sh tự thêm 2 flag --https-certificate-*-file vào
+    # cuối danh sách args phía trên khi exec sang kc.sh thật.
     environment:
       KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      # entrypoint-wrapper.sh/fetch-cert.sh dùng — cổng 8001 (KHÔNG phải
+      # 8000) vì đó là cổng HTTP thường nội bộ của chính Orchestrator, dùng
+      # riêng cho các lần "xin cert" như thế này (xem app/serve.py và
+      # comment tương đương ở service job-dispatcher/agent-manager).
+      ORCHESTRATOR_INTERNAL_HOST: orchestrator
+      ORCHESTRATOR_INTERNAL_PORT: "8001"
+      KEYCLOAK_TLS_SHARED_SECRET: ${KEYCLOAK_TLS_SHARED_SECRET}
     volumes:
       - keycloak-data:/opt/keycloak/data
       - ./infra/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
-    ports:
-      - "8080:8080"
+    depends_on:
+      # Chiều MỚI (Keycloak cần Orchestrator chạy để xin cert TLS lúc khởi
+      # động) — KHÔNG giữ chiều cũ orchestrator: depends_on: keycloak (đã bỏ
+      # ở service orchestrator bên dưới), giữ cả 2 chiều sẽ tạo circular
+      # dependency giống đúng sự cố đã gặp lúc làm mTLS Orchestrator/
+      # job-dispatcher (xem README.md gốc mục đó) — service_started là đủ
+      # (không cần service_healthy: fetch-cert.sh tự retry/backoff nếu
+      # Orchestrator chưa kịp alembic-migrate + tự mint cert xong).
+      orchestrator:
+        condition: service_started
+    # Mục "thống nhất 1 port" — KHÔNG còn publish port ra host (trước là
+    # "8444:8443", đổi từ 8443 gốc vì trùng agent-manager). Browser giờ chỉ
+    # vào port 3000 (web), nginx ở đó reverse-proxy "/realms/*"/"/resources/*"
+    # sang chính container này qua mgmt-net (tên service "keycloak", DNS nội
+    # bộ Docker) — cổng TRONG container vẫn là 8443, chỉ không map ra host nữa.
     networks: [mgmt-net]
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080"]
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8443"]
+      # Thêm thời gian so với trước (bootstrap cert TLS qua fetch-cert.sh có
+      # thể tốn tới 60s nếu Orchestrator vừa mới khởi động cùng lúc, cộng
+      # thêm thời gian Keycloak/Quarkus khởi động như bình thường).
       interval: 10s
       timeout: 5s
-      retries: 15
+      retries: 24
 
   # CA/Secrets cluster — cố ý đặt trên network riêng (ca-net), không public port,
   # không có route trực tiếp từ web/Keycloak. Chỉ orchestrator (control-plane) được gọi.
@@ -155,7 +193,17 @@ services:
       # Hostname nội bộ trong docker network — orchestrator dùng để tự fetch
       # JWKS, tách biệt với KEYCLOAK_ISSUER_URL (URL công khai cho browser, vd
       # "localhost:8080") mà container không tự resolve tới được. Xem app/config.py.
-      KEYCLOAK_INTERNAL_URL: http://keycloak:8080/realms/hardening-console
+      # https + cổng 8443 (mục "Dựng TLS thật", trước là http/8080) — cert
+      # Keycloak do step-ca nội bộ ký, Orchestrator tự trust qua ssl_context
+      # trong app/auth.py (KHÔNG dùng CA hệ thống mặc định).
+      KEYCLOAK_INTERNAL_URL: https://keycloak:8443/realms/hardening-console
+      # Secret của client "orchestrator-admin" — Orchestrator tự gọi Keycloak
+      # Admin REST API bằng service account này (app/keycloak_admin.py, tính
+      # năng Quản lý người dùng). KHÁC KEYCLOAK_TLS_SHARED_SECRET (đó là để
+      # xin cert TLS, không liên quan Admin API) — client này phải tạo riêng
+      # qua ./infra/keycloak/bootstrap-admin-client.sh, không tự có sau khi
+      # import realm-export.json (xem infra/keycloak/README.md).
+      KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET}
       SECRET_KEY: ${ORCHESTRATOR_SECRET_KEY}
       STEPCA_PROVISIONER_PASSWORD: ${STEPCA_PROVISIONER_PASSWORD}
       JOB_DISPATCHER_URL: https://job-dispatcher:9100
@@ -174,6 +222,14 @@ services:
       # này) sẽ gọi vào /internal/agent/* bằng secret này — cùng pattern
       # JOB_DISPATCHER_SHARED_SECRET.
       AGENT_MANAGER_SHARED_SECRET: ${AGENT_MANAGER_SHARED_SECRET}
+      # Dựng TLS thật cho Keycloak/Web (mục app/serve.py + app/jobs.py:
+      # keycloak_server_cert/web_server_cert) — mỗi service 1 secret riêng,
+      # KHÔNG dùng chung AGENT_MANAGER_SHARED_SECRET/JOB_DISPATCHER_SHARED_SECRET.
+      KEYCLOAK_TLS_SHARED_SECRET: ${KEYCLOAK_TLS_SHARED_SECRET}
+      WEB_TLS_SHARED_SECRET: ${WEB_TLS_SHARED_SECRET}
+      # IP/hostname LAN browser dùng để truy cập — bắt buộc có trong SAN của
+      # cert Keycloak/Web/chính Orchestrator, xem app/config.py:public_host.
+      PUBLIC_HOST: ${PUBLIC_HOST}
       # execution-env's remediate.sh dùng fingerprint này để verify chữ ký
       # bundle remediation trước khi chạy ansible-playbook — xem app/jobs.py
       # và scripts/content-signing/README.md.
@@ -219,21 +275,28 @@ services:
       - ./apps/agent/provision.sh:/agent-assets/provision.sh:ro
       - ./apps/agent/hardening-agent.service:/agent-assets/hardening-agent.service:ro
       - ./apps/agent/executor/hardening-executor.service:/agent-assets/hardening-executor.service:ro
+      # File playbook Ansible chính thức (ComplianceAsCode) cho tab "Template"
+      # trong Control Registry — xem app/control_templates.py.
+      - ./control-templates:/control-templates:ro
     depends_on:
       postgres:
         condition: service_healthy
-      keycloak:
-        condition: service_healthy
       step-ca:
         condition: service_healthy
-      # KHÔNG phụ thuộc job-dispatcher — bỏ đi (trước đây có nhưng không có
-      # lý do thực sự: Orchestrator chỉ gọi job-dispatcher LAZY khi có job
-      # thật, không cần nó start trước). Giờ QUAN HỆ NGƯỢC LẠI mới đúng thực
-      # tế: job-dispatcher cần Orchestrator chạy để xin server cert mTLS lúc
-      # khởi động (xem service job-dispatcher bên dưới) — giữ cả 2 chiều sẽ
-      # tạo circular dependency, Docker Compose từ chối khởi động.
-    ports:
-      - "8000:8000"
+      # KHÔNG phụ thuộc job-dispatcher/keycloak — bỏ đi (job-dispatcher: từ
+      # trước đã không có lý do thực sự, chỉ gọi LAZY khi có job thật.
+      # keycloak: mục "Dựng TLS thật" mới đảo NGƯỢC quan hệ — Keycloak giờ
+      # cần Orchestrator chạy trước để xin cert TLS lúc khởi động, xem
+      # service keycloak bên dưới — giữ cả 2 chiều sẽ tạo circular
+      # dependency, đúng lớp sự cố đã gặp khi làm mTLS Orchestrator/
+      # job-dispatcher trước đây). PyJWKClient (app/auth.py) tự fetch JWKS
+      # LAZY lúc có request đầu tiên cần verify token, không phải lúc import
+      # module, nên Orchestrator không cần Keycloak sẵn sàng ngay lúc khởi
+      # động — xác nhận qua đọc trực tiếp PyJWT (không suy đoán).
+    # Mục "thống nhất 1 port" — KHÔNG còn publish 8000 ra host. Browser giờ
+    # chỉ vào port 3000 (web), nginx ở đó reverse-proxy "/api/*" sang chính
+    # container này qua mgmt-net (tên service "orchestrator", DNS nội bộ
+    # Docker) — không cần publish port ra ngoài LAN nữa.
     # Orchestrator nối mgmt-net + ca-net (mục 4.1, để tự cấp SSH cert ngắn hạn
     # cho job) + job-net (gọi job-dispatcher) — nhưng KHÔNG có quyền Docker
     # trực tiếp, xem apps/job-dispatcher/README.md.
@@ -255,7 +318,12 @@ services:
       # job-dispatcher không nối ca-net — xin cert server mTLS của chính nó
       # qua Orchestrator (POST /internal/job-dispatcher/server-cert), tự
       # renew định kỳ, cùng pattern agent-manager. Xem app/serve.py.
-      ORCHESTRATOR_URL: http://orchestrator:8000
+      # Cổng 8001 (KHÔNG phải 8000) — Orchestrator giờ phục vụ 2 cổng riêng
+      # (xem apps/orchestrator/app/serve.py): 8000 là HTTPS browser-facing
+      # (mục "Dựng TLS thật"), 8001 là HTTP thường NỘI BỘ chỉ dùng cho các
+      # lần "xin cert" như thế này — tránh đòi job-dispatcher phải làm TLS
+      # client (thêm CA trust) chỉ để gọi đúng 1 endpoint bootstrap.
+      ORCHESTRATOR_URL: http://orchestrator:8001
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -271,7 +339,9 @@ services:
     build: ./apps/agent-manager
     restart: unless-stopped
     environment:
-      ORCHESTRATOR_URL: http://orchestrator:8000
+      # Cổng 8001 nội bộ, KHÔNG phải 8000 (HTTPS browser-facing) — xem
+      # comment tương đương ở service job-dispatcher phía trên.
+      ORCHESTRATOR_URL: http://orchestrator:8001
       AGENT_MANAGER_SHARED_SECRET: ${AGENT_MANAGER_SHARED_SECRET}
     depends_on:
       orchestrator:
@@ -289,11 +359,21 @@ services:
     build:
       context: ./apps/web
       args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL}
-        VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL}
+        # Mục "thống nhất 1 port" — không còn VITE_API_BASE_URL/
+        # VITE_KEYCLOAK_URL (xem apps/web/Dockerfile + nginx.conf).
         VITE_KEYCLOAK_REALM: ${VITE_KEYCLOAK_REALM}
         VITE_KEYCLOAK_CLIENT_ID: ${VITE_KEYCLOAK_CLIENT_ID}
     restart: unless-stopped
+    environment:
+      # entrypoint-wrapper.sh/fetch-cert.sh dùng (mục "Dựng TLS thật") —
+      # cổng 8001 nội bộ của Orchestrator, cùng lý do đã ghi ở service
+      # job-dispatcher/agent-manager/keycloak phía trên.
+      ORCHESTRATOR_INTERNAL_HOST: orchestrator
+      ORCHESTRATOR_INTERNAL_PORT: "8001"
+      WEB_TLS_SHARED_SECRET: ${WEB_TLS_SHARED_SECRET}
+    depends_on:
+      orchestrator:
+        condition: service_started
     ports:
-      - "3000:80"
+      - "3000:443"
     networks: [mgmt-net]

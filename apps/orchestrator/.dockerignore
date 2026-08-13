@@ -1,0 +1,6 @@
+# Bytecode cache — nếu lỡ tồn tại sẵn trên disk host lúc build (vd chạy
+# pytest trực tiếp ngoài container ở lần nào đó), KHÔNG được để lọt vào
+# image qua "COPY . ." — verify thật đã gặp: pytest chạy nhầm .pyc cũ, test
+# fail với nội dung không khớp source hiện tại, dù source đã sửa đúng.
+__pycache__/
+*.pyc

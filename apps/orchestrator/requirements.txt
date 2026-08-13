@@ -10,6 +10,10 @@ httpx==0.27.2
 # PyJWT[crypto] (transitive), khai rõ ràng ở đây để không phụ thuộc ngầm vào
 # extras của 1 package khác cho 1 nhu cầu bảo mật riêng.
 cryptography==49.0.0
+# Parse file playbook Ansible chính thức (ComplianceAsCode) cho tab
+# "Template" (xem app/control_templates.py) — vốn đã có sẵn qua transitive
+# dependency (Ansible-adjacent tooling), khai rõ ràng để không phụ thuộc ngầm.
+PyYAML==6.0.3
 
 # dev/test
 pytest==8.3.3

@@ -22,7 +22,10 @@
 
   vars:
     ca_ssh_user_pubkey_path: "{{ playbook_dir }}/../files/ssh_user_ca.pub"  # export từ step-ca, xem infra/step-ca/README.md
-    orchestrator_audit_url: "http://localhost:8000/internal/audit-events"
+    # Mục "thống nhất 1 port" — Orchestrator không còn publish port riêng
+    # (8000), chỉ còn reachable qua nginx reverse-proxy của Web (port 3000,
+    # tiền tố "/api", xem apps/web/nginx.conf).
+    orchestrator_audit_url: "https://localhost:3000/api/internal/audit-events"
     sshd_ca_trust_file: /etc/ssh/user_ca.pub
     # Tên unit systemd của sshd khác nhau giữa các distro: Debian/Ubuntu dùng
     # "ssh", RHEL/CentOS/Rocky dùng "sshd". Cho phép override qua -e nếu cần.
@@ -86,6 +89,11 @@
           payload:
             step: "trust_deployed_old_credential_still_active"
         status_code: [200, 201]
+        # cert TLS của Orchestrator do step-ca nội bộ ký (mục "Dựng TLS
+        # thật") — ansible control node không có root CA đó trong trust
+        # store hệ thống, chấp nhận được ở quy mô lab (cùng mức rủi ro đã
+        # chấp nhận cho browser tự ký khác trong dự án này).
+        validate_certs: false
       delegate_to: localhost
       failed_when: false   # không chặn migration nếu Orchestrator tạm thời chưa lên — nhưng nên retry thủ công sau
 
