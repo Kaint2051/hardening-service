@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import Table from "@mui/material/Table";
 import TableHead from "@mui/material/TableHead";
 import TableBody from "@mui/material/TableBody";
@@ -17,31 +17,25 @@ import Dialog from "@mui/material/Dialog";
 import DialogTitle from "@mui/material/DialogTitle";
 import DialogContent from "@mui/material/DialogContent";
 import DialogActions from "@mui/material/DialogActions";
-import Snackbar from "@mui/material/Snackbar";
 import Alert from "@mui/material/Alert";
 import CircularProgress from "@mui/material/CircularProgress";
-import { api, ApiError } from "../api/client";
+import { api } from "../api/client";
 import { JOB_STATUSES, JOB_TYPES } from "../api/types";
-import type { JobListItemOut, JobOut } from "../api/types";
+import type { Finding, JobListItemOut, JobOut } from "../api/types";
+import DiffView from "../components/DiffView";
+import FindingsTable from "../components/FindingsTable";
+import PageHeader from "../components/PageHeader";
+import { useSnackbar } from "../hooks/useSnackbar";
+import { useLatestRequest } from "../hooks/useLatestRequest";
+import { errMessage } from "../lib/errors";
+import { progressColor } from "../lib/statusColors";
 
 const PAGE_SIZE = 20;
 
-const statusColor: Record<string, "default" | "warning" | "success" | "error"> = {
-  pending: "default",
-  running: "warning",
-  succeeded: "success",
-  failed: "error",
-};
-
-// Findings (xem app/jobs.py _parse_scan_summary) chỉ có ý nghĩa cho job_type
-// "scan"/"agent-scan" — remediate-*/restore không có mảng này trong
-// result_summary, dialog chi tiết tự rơi về hiển thị JSON thô cho các loại đó.
-type Finding = { rule_id: string; title: string; result: string; severity: string };
-
 export default function JobsPage() {
+  const { showSuccess, showError } = useSnackbar();
   const [jobs, setJobs] = useState<JobListItemOut[]>([]);
   const [loading, setLoading] = useState(true);
-  const [snack, setSnack] = useState<{ severity: "success" | "error"; message: string } | null>(null);
 
   const [hostnameFilter, setHostnameFilter] = useState("");
   const [hostnameInput, setHostnameInput] = useState("");
@@ -57,7 +51,7 @@ export default function JobsPage() {
   const [detailJobId, setDetailJobId] = useState<number | null>(null);
   const [detailJob, setDetailJob] = useState<JobOut | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
-  const detailRequestIdRef = useRef(0);
+  const beginDetail = useLatestRequest();
 
   // "1-click restore" (break-glass, xem app/jobs.py:run_restore) — chỉ hiện
   // cho job remediate-apply đã succeeded. Yêu cầu 1 bước xác nhận rõ ràng
@@ -68,13 +62,11 @@ export default function JobsPage() {
 
   // Đổi filter/trang liên tiếp trước khi request trước hoàn tất có thể khiến
   // response CŨ (vd hostname "web-01" chậm hơn) ghi đè lên response MỚI hơn
-  // (vd "web-02" nhanh hơn, tới trước) — cùng lớp bug đã gặp và sửa ở
-  // HostsPage.tsx (enrollRequestIdRef), áp dụng lại đúng kỹ thuật đó: chỉ
-  // "commit" kết quả nếu vẫn là request mới nhất khi nó resolve.
-  const requestIdRef = useRef(0);
+  // (vd "web-02" nhanh hơn, tới trước) — race-guard dùng chung useLatestRequest.
+  const beginLoad = useLatestRequest();
 
   const loadJobs = () => {
-    const requestId = ++requestIdRef.current;
+    const isStale = beginLoad();
     setLoading(true);
     api
       .listJobs({
@@ -85,15 +77,15 @@ export default function JobsPage() {
         offset,
       })
       .then((result) => {
-        if (requestIdRef.current !== requestId) return;
+        if (isStale()) return;
         setJobs(result);
       })
       .catch((err) => {
-        if (requestIdRef.current !== requestId) return;
-        setSnack({ severity: "error", message: err instanceof ApiError ? err.message : String(err) });
+        if (isStale()) return;
+        showError(errMessage(err));
       })
       .finally(() => {
-        if (requestIdRef.current === requestId) setLoading(false);
+        if (!isStale()) setLoading(false);
       });
   };
 
@@ -108,7 +100,7 @@ export default function JobsPage() {
   };
 
   const openJobDetail = (jobId: number) => {
-    const requestId = ++detailRequestIdRef.current;
+    const isStale = beginDetail();
     setDetailJobId(jobId);
     setDetailJob(null);
     setDetailLoading(true);
@@ -116,23 +108,23 @@ export default function JobsPage() {
     api
       .getJob(jobId)
       .then((result) => {
-        if (detailRequestIdRef.current !== requestId) return;
+        if (isStale()) return;
         setDetailJob(result);
       })
       .catch((err) => {
-        if (detailRequestIdRef.current !== requestId) return;
-        setSnack({ severity: "error", message: err instanceof ApiError ? err.message : String(err) });
+        if (isStale()) return;
+        showError(errMessage(err));
         setDetailJobId(null);
       })
       .finally(() => {
-        if (detailRequestIdRef.current === requestId) setDetailLoading(false);
+        if (!isStale()) setDetailLoading(false);
       });
   };
 
   const closeJobDetail = () => {
-    // Bump ref để bất kỳ request nào đang bay lúc đóng dialog cũng bị bỏ qua
+    // Bump guard để bất kỳ request nào đang bay lúc đóng dialog cũng bị bỏ qua
     // khi resolve — tránh setDetailJob() âm thầm chạy nền sau khi đóng.
-    ++detailRequestIdRef.current;
+    beginDetail();
     setDetailJobId(null);
     setDetailJob(null);
     setRestoreConfirming(false);
@@ -143,31 +135,33 @@ export default function JobsPage() {
     setRestoring(true);
     try {
       const restoreJob = await api.restoreHost(detailJob.hostname, detailJob.id);
-      setSnack({
-        severity: "success",
-        message: `Đã tạo job restore #${restoreJob.id} (${restoreJob.status}) cho ${detailJob.hostname} — xem chi tiết trong bảng.`,
-      });
+      showSuccess(
+        `Đã tạo job restore #${restoreJob.id} (${restoreJob.status}) cho ${detailJob.hostname} — xem chi tiết trong bảng.`
+      );
       closeJobDetail();
       loadJobs();
     } catch (err) {
-      setSnack({ severity: "error", message: err instanceof ApiError ? err.message : String(err) });
+      showError(errMessage(err));
     } finally {
       setRestoring(false);
     }
   };
 
   const findings = (detailJob?.result_summary?.findings as Finding[] | undefined) ?? [];
+  const diffOutput = detailJob?.result_summary?.diff_output as string | undefined;
   const backupTruncated = Boolean(detailJob?.result_summary?.backup_truncated);
   const canOfferRestore = detailJob?.job_type === "remediate-apply" && detailJob?.status === "succeeded";
 
   return (
     <Stack spacing={2}>
-      <Stack direction="row" justifyContent="space-between" alignItems="center">
-        <Typography variant="h5">Jobs</Typography>
-        <Button variant="outlined" onClick={loadJobs}>
-          Tải lại
-        </Button>
-      </Stack>
+      <PageHeader
+        title="Jobs"
+        actions={
+          <Button variant="outlined" onClick={loadJobs}>
+            Tải lại
+          </Button>
+        }
+      />
 
       <Stack direction="row" spacing={2} alignItems="center">
         <TextField
@@ -237,7 +231,7 @@ export default function JobsPage() {
                   <TableCell>{j.hostname}</TableCell>
                   <TableCell>{j.job_type}</TableCell>
                   <TableCell>
-                    <Chip label={j.status} size="small" color={statusColor[j.status] ?? "default"} />
+                    <Chip label={j.status} size="small" color={progressColor(j.status)} />
                   </TableCell>
                   <TableCell>{j.triggered_by}</TableCell>
                   <TableCell>{new Date(j.created_at).toLocaleString("vi-VN")}</TableCell>
@@ -288,11 +282,7 @@ export default function JobsPage() {
               <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
                 <Chip label={detailJob.hostname} size="small" />
                 <Chip label={detailJob.job_type} size="small" />
-                <Chip
-                  label={detailJob.status}
-                  size="small"
-                  color={statusColor[detailJob.status] ?? "default"}
-                />
+                <Chip label={detailJob.status} size="small" color={progressColor(detailJob.status)} />
                 {detailJob.control_id && <Chip label={`control: ${detailJob.control_id}`} size="small" />}
               </Stack>
               <Typography variant="body2" color="text.secondary">
@@ -302,32 +292,9 @@ export default function JobsPage() {
                   ` — kết thúc ${new Date(detailJob.finished_at).toLocaleString("vi-VN")}`}
               </Typography>
               {findings.length > 0 ? (
-                <TableContainer component={Paper}>
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Rule</TableCell>
-                        <TableCell>Kết quả</TableCell>
-                        <TableCell>Mức độ</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {findings.map((f) => (
-                        <TableRow key={f.rule_id}>
-                          <TableCell>{f.title}</TableCell>
-                          <TableCell>
-                            <Chip
-                              label={f.result}
-                              size="small"
-                              color={f.result === "pass" ? "success" : "error"}
-                            />
-                          </TableCell>
-                          <TableCell>{f.severity}</TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </TableContainer>
+                <FindingsTable findings={findings} />
+              ) : diffOutput ? (
+                <DiffView diffText={diffOutput} />
               ) : (
                 <Typography
                   component="pre"
@@ -395,10 +362,6 @@ export default function JobsPage() {
           <Button onClick={closeJobDetail}>Đóng</Button>
         </DialogActions>
       </Dialog>
-
-      <Snackbar open={snack !== null} autoHideDuration={5000} onClose={() => setSnack(null)}>
-        {snack ? <Alert severity={snack.severity}>{snack.message}</Alert> : undefined}
-      </Snackbar>
     </Stack>
   );
 }

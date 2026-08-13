@@ -20,6 +20,15 @@ from app.db import Base
 from app.models import Control, Host, Job, RemediationVariant
 from app.main import app
 
+# Giữ tham chiếu hàm THẬT TRƯỚC khi bất kỳ fixture nào monkeypatch
+# agents_module._dispatch_agent_install_job thành spy/no-op (xem fixture
+# _mock_agent_install_background bên dưới — KHÁC helper _mock_agent_install_dispatch
+# đã có sẵn ở dưới, tên gần giống nhưng là 2 thứ khác nhau, xem chú thích tại
+# đó — cùng GOTCHA #2 trong docstring đầu test_canary.py/test_jobs.py) — dùng
+# để tự gọi trực tiếp, đồng bộ, khi 1 test cần quan sát kết quả cuối của phần
+# chạy trong BackgroundTasks.
+_real_dispatch_agent_install_job = agents_module._dispatch_agent_install_job
+
 _engine = create_engine(
     "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
 )
@@ -83,6 +92,22 @@ def _mock_audit(monkeypatch):
     return calls
 
 
+@pytest.fixture(autouse=True)
+def _mock_agent_install_background(monkeypatch):
+    # trigger_agent_install giờ chạy phần chờ job-dispatcher qua BackgroundTasks
+    # (_dispatch_agent_install_job, mở SessionLocal() RIÊNG — KHÔNG qua
+    # Depends(_get_db)) — cùng gotcha đã giải quyết cho canary.py/ssh-check
+    # (xem docstring đầu test_canary.py, fixture tương ứng trong test_jobs.py):
+    #   1. Trỏ agents_module.SessionLocal về engine SQLite test.
+    #   2. Thay _dispatch_agent_install_job bằng spy ghi lại args (KHÔNG chạy
+    #      thật) — response POST luôn serialize lúc job còn "running", test
+    #      cần xem kết quả cuối tự gọi lại _real_dispatch_agent_install_job(*args).
+    monkeypatch.setattr(agents_module, "SessionLocal", _TestSessionLocal)
+    calls = []
+    monkeypatch.setattr(agents_module, "_dispatch_agent_install_job", lambda *a: calls.append(a))
+    return calls
+
+
 def _clear_user_override():
     app.dependency_overrides.pop(get_current_user, None)
 
@@ -90,11 +115,12 @@ def _clear_user_override():
 def _register_host(
     hostname="agent-test.internal", blocked=False, active_response_enabled=True,
     ca_migration_status="not_started", ssh_user="root", decommissioned=False,
+    os_family="Ubuntu", os_version="24.04",
 ):
     db = _TestSessionLocal()
     db.add(Host(
-        hostname=hostname, ip_address="10.0.0.50", os_family="Ubuntu",
-        os_version="24.04", added_by="opuser", agent_renewal_blocked=blocked,
+        hostname=hostname, ip_address="10.0.0.50", os_family=os_family,
+        os_version=os_version, added_by="opuser", agent_renewal_blocked=blocked,
         active_response_enabled=active_response_enabled,
         ca_migration_status=ca_migration_status, ssh_user=ssh_user,
         decommissioned_at=datetime.now(timezone.utc) if decommissioned else None,
@@ -105,14 +131,24 @@ def _register_host(
 
 
 def _mock_agent_install_dispatch(monkeypatch, exit_code=0, logs="AGENT_INSTALL_STATUS=ok\n"):
+    # Helper THƯỜNG (không phải fixture) mock httpx.post/_get_ssh_dispatch_environment
+    # cho phần _call_job_dispatcher THẬT — gọi tường minh trong từng test cần
+    # nó. KHÁC fixture autouse _mock_agent_install_background ở trên (mock
+    # SessionLocal + spy chặn hẳn _dispatch_agent_install_job) — tên gần
+    # giống nhau nhưng phục vụ 2 mục đích khác nhau, xem docstring tương ứng.
     # Mirror test_jobs.py's _mock_cert/_mock_dispatcher_success — nhưng
-    # trigger_agent_install gọi mint_ssh_certificate qua namespace agents_module
-    # (import trực tiếp vào app/agents.py), còn mint_agent_manager_server_cert
-    # + httpx.post là 2 lời gọi NỘI BỘ của _call_job_dispatcher (định nghĩa
-    # trong app/jobs.py) nên phải mock trên jobs_module/httpx global, KHÔNG
-    # phải agents_module — patch nhầm namespace sẽ không có tác dụng gì.
+    # trigger_agent_install gọi _get_ssh_dispatch_environment qua namespace
+    # agents_module (import trực tiếp vào app/agents.py từ app/jobs.py — xem
+    # docstring hàm đó), còn mint_agent_manager_server_cert + httpx.post là 2
+    # lời gọi NỘI BỘ của _call_job_dispatcher (định nghĩa trong app/jobs.py)
+    # nên phải mock trên jobs_module/httpx global, KHÔNG phải agents_module —
+    # patch nhầm namespace sẽ không có tác dụng gì.
     monkeypatch.setattr(
-        agents_module, "mint_ssh_certificate", lambda principal: ("FAKE-PRIVATE-KEY", "FAKE-CERT-PUB")
+        agents_module, "_get_ssh_dispatch_environment",
+        lambda host, principal: {
+            "SSH_KEY_B64": base64.b64encode(b"FAKE-PRIVATE-KEY").decode(),
+            "SSH_CERT_B64": base64.b64encode(b"FAKE-CERT-PUB").decode(),
+        },
     )
     monkeypatch.setattr(
         jobs_module, "mint_agent_manager_server_cert",
@@ -384,6 +420,73 @@ def test_heartbeat_updates_last_seen():
     db.close()
 
 
+def test_heartbeat_sets_os_family_and_version_when_previously_unknown():
+    # Host đăng ký qua UI/API không còn khai os_family (xem
+    # app/schemas.py:HostCreate) — Agent tự nhận diện (apps/agent/main.go:
+    # detectOS) rồi báo qua chính heartbeat này.
+    _register_host(os_family=None, os_version=None)
+    resp = client.post(
+        "/internal/agent/heartbeat",
+        json={"hostname": "agent-test.internal", "os_family": "Ubuntu", "os_version": "22.04"},
+        headers=AUTH_HEADER,
+    )
+    assert resp.status_code == 204
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "agent-test.internal")
+    assert host.os_family == "Ubuntu"
+    assert host.os_version == "22.04"
+    db.close()
+
+
+def test_heartbeat_without_os_fields_does_not_clear_existing_value():
+    # Thiếu field (Agent cũ chưa nâng cấp, hoặc detectOS thất bại tạm thời ở
+    # 1 lần heartbeat) KHÔNG được coi là "xoá" — khác hẳn semantics
+    # ssh_password của HostUpdate (đó là sửa tay có chủ đích).
+    _register_host(os_family="Ubuntu", os_version="24.04")
+    resp = client.post(
+        "/internal/agent/heartbeat", json={"hostname": "agent-test.internal"}, headers=AUTH_HEADER
+    )
+    assert resp.status_code == 204
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "agent-test.internal")
+    assert host.os_family == "Ubuntu"
+    assert host.os_version == "24.04"
+    db.close()
+
+
+def test_heartbeat_same_os_value_is_a_noop_and_does_not_audit(_mock_audit):
+    _register_host(os_family="Ubuntu", os_version="24.04")
+    resp = client.post(
+        "/internal/agent/heartbeat",
+        json={"hostname": "agent-test.internal", "os_family": "Ubuntu", "os_version": "24.04"},
+        headers=AUTH_HEADER,
+    )
+    assert resp.status_code == 204
+    assert not any(c["action"] == "agent_os_info_updated" for c in _mock_audit)
+
+
+def test_heartbeat_changed_os_value_audits_exactly_once(_mock_audit):
+    _register_host(os_family="Ubuntu", os_version="24.04")
+    resp = client.post(
+        "/internal/agent/heartbeat",
+        json={"hostname": "agent-test.internal", "os_family": "Debian", "os_version": "12"},
+        headers=AUTH_HEADER,
+    )
+    assert resp.status_code == 204
+
+    os_update_calls = [c for c in _mock_audit if c["action"] == "agent_os_info_updated"]
+    assert len(os_update_calls) == 1
+    assert os_update_calls[0]["payload"] == {"os_family": "Debian", "os_version": "12"}
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "agent-test.internal")
+    assert host.os_family == "Debian"
+    assert host.os_version == "12"
+    db.close()
+
+
 def test_heartbeat_unknown_host_404():
     resp = client.post(
         "/internal/agent/heartbeat", json={"hostname": "does-not-exist"}, headers=AUTH_HEADER
@@ -396,6 +499,145 @@ def test_heartbeat_requires_shared_secret():
     assert resp.status_code == 401
 
 
+_METRICS_BODY = {
+    "hostname": "agent-test.internal",
+    "cpu_pct": 42.5,
+    "ram_pct": 60.1,
+    "disk_pct": 73.9,
+    "net_iface": "eth0",
+    "net_pct": 12.3,
+}
+
+
+def test_agent_metrics_updates_host_metrics_and_timestamp():
+    _register_host()
+    resp = client.post("/internal/agent/host-metrics", json=_METRICS_BODY, headers=AUTH_HEADER)
+    assert resp.status_code == 204
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "agent-test.internal")
+    assert host.metrics == {
+        "cpu_pct": 42.5, "ram_pct": 60.1, "disk_pct": 73.9, "net_iface": "eth0", "net_pct": 12.3,
+    }
+    assert host.metrics_updated_at is not None
+    db.close()
+
+
+def test_agent_metrics_overwrites_previous_value_entirely():
+    _register_host()
+    client.post("/internal/agent/host-metrics", json=_METRICS_BODY, headers=AUTH_HEADER)
+    # Lần báo cáo THỨ 2 không có net_iface/net_pct (vd tốc độ link không đọc
+    # được lần này) — phải GHI ĐÈ toàn bộ dict, không giữ lại net_iface/
+    # net_pct cũ từ lần trước (host.metrics là snapshot MỚI NHẤT, không phải
+    # merge tích lũy).
+    resp = client.post(
+        "/internal/agent/host-metrics",
+        json={"hostname": "agent-test.internal", "cpu_pct": 5.0, "ram_pct": 10.0, "disk_pct": 15.0},
+        headers=AUTH_HEADER,
+    )
+    assert resp.status_code == 204
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "agent-test.internal")
+    assert host.metrics == {"cpu_pct": 5.0, "ram_pct": 10.0, "disk_pct": 15.0}
+    db.close()
+
+
+def test_agent_metrics_unknown_host_404():
+    resp = client.post("/internal/agent/host-metrics", json=_METRICS_BODY, headers=AUTH_HEADER)
+    assert resp.status_code == 404
+
+
+def test_agent_metrics_requires_shared_secret():
+    resp = client.post("/internal/agent/host-metrics", json=_METRICS_BODY)
+    assert resp.status_code == 401
+
+
+def test_agent_metrics_rejects_wrong_shared_secret():
+    resp = client.post(
+        "/internal/agent/host-metrics", json=_METRICS_BODY, headers={"Authorization": "Bearer wrong-secret"}
+    )
+    assert resp.status_code == 401
+
+
+def test_agent_metrics_rejects_out_of_range_percent():
+    _register_host()
+    bad_body = {**_METRICS_BODY, "cpu_pct": 150}
+    resp = client.post("/internal/agent/host-metrics", json=bad_body, headers=AUTH_HEADER)
+    assert resp.status_code == 422
+
+
+def test_agent_metrics_does_not_write_audit_event(_mock_audit):
+    # Mirror lý do heartbeat KHÔNG audit mỗi lần (agent_heartbeat ở trên) —
+    # metrics còn lặp dày hơn (~3 phút), audit mỗi lần sẽ ngập audit log.
+    _register_host()
+    client.post("/internal/agent/host-metrics", json=_METRICS_BODY, headers=AUTH_HEADER)
+    assert not any(c["action"].startswith("agent_metrics") for c in _mock_audit)
+
+
+def test_agent_metrics_stores_executor_reachable_false():
+    _register_host()
+    body = {**_METRICS_BODY, "executor_reachable": False}
+    resp = client.post("/internal/agent/host-metrics", json=body, headers=AUTH_HEADER)
+    assert resp.status_code == 204
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "agent-test.internal")
+    assert host.metrics["executor_reachable"] is False
+    db.close()
+
+
+def test_agent_metrics_omits_executor_reachable_key_when_not_sent():
+    # None (Agent bản cũ chưa biết field này) KHÔNG được ghi "executor_reachable"
+    # với giá trị None/null vào Host.metrics — bỏ HẲN key, khớp quy ước
+    # net_iface/net_pct đã có.
+    _register_host()
+    resp = client.post("/internal/agent/host-metrics", json=_METRICS_BODY, headers=AUTH_HEADER)
+    assert resp.status_code == 204
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "agent-test.internal")
+    assert "executor_reachable" not in host.metrics
+    db.close()
+
+
+def test_agent_metrics_stores_system_info_and_updates_timestamp():
+    _register_host()
+    body = {
+        **_METRICS_BODY,
+        "system_info": {"os_pretty": "Ubuntu 22.04.4 LTS", "kernel": "5.15.0-46-generic", "cpu_cores": "2"},
+    }
+    resp = client.post("/internal/agent/host-metrics", json=body, headers=AUTH_HEADER)
+    assert resp.status_code == 204
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "agent-test.internal")
+    assert host.system_info == {
+        "os_pretty": "Ubuntu 22.04.4 LTS", "kernel": "5.15.0-46-generic", "cpu_cores": "2",
+    }
+    assert host.system_info_updated_at is not None
+    db.close()
+
+
+def test_agent_metrics_without_system_info_does_not_touch_existing_value():
+    # Thiếu field (chưa tới lượt gửi, hoặc Agent cũ chưa biết) KHÔNG được coi
+    # là "xoá" system_info đã có — cùng nguyên tắc os_family/os_version ở
+    # agent_heartbeat.
+    _register_host()
+    client.post(
+        "/internal/agent/host-metrics",
+        json={**_METRICS_BODY, "system_info": {"os_pretty": "Ubuntu 22.04.4 LTS"}},
+        headers=AUTH_HEADER,
+    )
+    resp = client.post("/internal/agent/host-metrics", json=_METRICS_BODY, headers=AUTH_HEADER)
+    assert resp.status_code == 204
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "agent-test.internal")
+    assert host.system_info == {"os_pretty": "Ubuntu 22.04.4 LTS"}
+    db.close()
+
+
 def test_scan_result_creates_job(_mock_audit):
     _register_host()
     resp = client.post(
@@ -403,7 +645,11 @@ def test_scan_result_creates_job(_mock_audit):
         json={
             "hostname": "agent-test.internal",
             "scap_profile": "xccdf_org.ssgproject.content_profile_standard",
-            "result_summary": {"scan_result_pass": "10", "scan_result_fail": "2"},
+            "result_summary": {
+                "scan_job_status": "completed",
+                "scan_result_pass": "10",
+                "scan_result_fail": "2",
+            },
         },
         headers=AUTH_HEADER,
     )
@@ -417,6 +663,32 @@ def test_scan_result_creates_job(_mock_audit):
     assert job.triggered_by == "agent"
     db.close()
     assert any(c["action"] == "agent_scan_reported" for c in _mock_audit)
+
+
+def test_scan_result_with_internal_error_marks_job_failed(_mock_audit):
+    # apps/agent/scan.go báo scan_job_status="error" (thiếu datastream, oscap
+    # timeout...) và KHÔNG kèm "findings" — job phải thành "failed", không
+    # phải "succeeded" với 0 finding (dễ hiểu nhầm là máy đã đạt chuẩn).
+    _register_host()
+    resp = client.post(
+        "/internal/agent/scan-result",
+        json={
+            "hostname": "agent-test.internal",
+            "scap_profile": "xccdf_org.ssgproject.content_profile_standard",
+            "result_summary": {
+                "scan_job_status": "error",
+                "error": "không tạo được file kết quả",
+            },
+        },
+        headers=AUTH_HEADER,
+    )
+    assert resp.status_code == 201
+    job_id = resp.json()["job_id"]
+
+    db = _TestSessionLocal()
+    job = db.get(Job, job_id)
+    assert job.status == "failed"
+    db.close()
 
 
 def test_server_cert_requires_shared_secret():
@@ -690,6 +962,200 @@ def test_claim_remediate_job_renewal_blocked_returns_204_leaves_job_pending(_moc
     assert job.status == "pending"
     db.close()
     assert any(c["action"] == "remediate_claim_blocked_killswitch" for c in _mock_audit)
+
+
+def _insert_restore_job(
+    hostname="agent-test.internal", status="pending", source_job_id=None, triggered_by="opuser",
+):
+    db = _TestSessionLocal()
+    job = Job(
+        hostname=hostname, job_type="restore", status=status,
+        result_summary={"source_job_id": source_job_id} if source_job_id is not None else None,
+        triggered_by=triggered_by,
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    job_id = job.id
+    db.close()
+    return job_id
+
+
+def _insert_succeeded_apply_job_with_backup(hostname="agent-test.internal", backup_b64="ZmFrZS1iYWNrdXAtdGFyLWNvbnRlbnQ="):
+    db = _TestSessionLocal()
+    job = Job(
+        hostname=hostname, job_type="remediate-apply", status="succeeded", triggered_by="opuser",
+        result_summary={"backup_tar_b64": backup_b64, "backup_truncated": False, "exit_code": 0},
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    job_id = job.id
+    db.close()
+    return job_id
+
+
+# ---- POST /internal/agent/remediate-jobs/claim (job_type="restore" — CÙNG
+# endpoint claim với remediate, phân biệt qua job_kind, xem
+# app/jobs.py:_dispatch_restore_job_via_agent) ----
+
+
+def test_claim_remediate_job_claims_pending_restore_job():
+    _register_host()
+    source_job_id = _insert_succeeded_apply_job_with_backup()
+    job_id = _insert_restore_job(source_job_id=source_job_id)
+
+    resp = client.post(
+        "/internal/agent/remediate-jobs/claim", json={"hostname": "agent-test.internal"}, headers=AUTH_HEADER
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["job_id"] == job_id
+    assert body["job_kind"] == "restore"
+    assert body["backup_tar_b64"] == "ZmFrZS1iYWNrdXAtdGFyLWNvbnRlbnQ="
+    # control_id/remediation_ref rỗng, dry_run False — job restore không có
+    # RemediationVariant, KHÔNG phải thiếu sót.
+    assert body["control_id"] == ""
+    assert body["remediation_ref"] == ""
+    assert body["dry_run"] is False
+
+    db = _TestSessionLocal()
+    job = db.get(Job, job_id)
+    assert job.status == "running"
+    db.close()
+
+
+def test_claim_remediate_job_still_returns_job_kind_remediate_for_remediate_jobs():
+    # Hồi quy: thêm job_kind KHÔNG được đổi shape response cho đường remediate
+    # cũ (Agent hiện có đọc control_id/remediation_ref/dry_run y hệt trước).
+    _register_host()
+    variant_id = _register_control_and_variant()
+    _insert_remediate_job(job_type="remediate-dry-run", status="pending", remediation_variant_id=variant_id)
+
+    resp = client.post(
+        "/internal/agent/remediate-jobs/claim", json={"hostname": "agent-test.internal"}, headers=AUTH_HEADER
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["job_kind"] == "remediate"
+    assert body["control_id"] == "ctrl-1"
+    assert body["remediation_ref"] == "test-bundle-1"
+
+
+def test_claim_restore_job_missing_backup_on_source_job_500():
+    # Không nên xảy ra thật (run_restore đã validate backup TRƯỚC khi chuyển
+    # "pending") — nhưng nếu dữ liệu lệch, phải từ chối rõ ràng thay vì claim
+    # rồi gửi Agent 1 backup rỗng.
+    _register_host()
+    db = _TestSessionLocal()
+    source_job = Job(hostname="agent-test.internal", job_type="remediate-apply", status="succeeded", triggered_by="opuser", result_summary={})
+    db.add(source_job)
+    db.commit()
+    db.refresh(source_job)
+    source_job_id = source_job.id
+    db.close()
+    _insert_restore_job(source_job_id=source_job_id)
+
+    resp = client.post(
+        "/internal/agent/remediate-jobs/claim", json={"hostname": "agent-test.internal"}, headers=AUTH_HEADER
+    )
+    assert resp.status_code == 500
+
+
+def test_claim_restore_job_blocked_by_killswitch_leaves_job_pending(_mock_audit):
+    _register_host(active_response_enabled=False)
+    source_job_id = _insert_succeeded_apply_job_with_backup()
+    job_id = _insert_restore_job(source_job_id=source_job_id)
+
+    resp = client.post(
+        "/internal/agent/remediate-jobs/claim", json={"hostname": "agent-test.internal"}, headers=AUTH_HEADER
+    )
+    assert resp.status_code == 204
+
+    db = _TestSessionLocal()
+    job = db.get(Job, job_id)
+    assert job.status == "pending"
+    db.close()
+    assert any(c["action"] == "remediate_claim_blocked_killswitch" for c in _mock_audit)
+
+
+# ---- POST /internal/agent/restore-result ----
+
+
+def test_restore_result_requires_shared_secret():
+    resp = client.post("/internal/agent/restore-result", json={"hostname": "agent-test.internal", "job_id": 1, "exit_code": 0, "log_tail": ""})
+    assert resp.status_code == 401
+
+
+def test_restore_result_unknown_job_404():
+    resp = client.post(
+        "/internal/agent/restore-result",
+        json={"hostname": "agent-test.internal", "job_id": 999999, "exit_code": 0, "log_tail": ""},
+        headers=AUTH_HEADER,
+    )
+    assert resp.status_code == 404
+
+
+def test_restore_result_hostname_mismatch_422():
+    _register_host("host-a.internal")
+    _register_host("host-b.internal")
+    job_id = _insert_restore_job(hostname="host-a.internal", status="running", source_job_id=1)
+
+    resp = client.post(
+        "/internal/agent/restore-result",
+        json={"hostname": "host-b.internal", "job_id": job_id, "exit_code": 0, "log_tail": ""},
+        headers=AUTH_HEADER,
+    )
+    assert resp.status_code == 422
+
+
+def test_restore_result_not_running_409(_mock_audit):
+    job_id = _insert_restore_job(status="pending", source_job_id=1)
+
+    resp = client.post(
+        "/internal/agent/restore-result",
+        json={"hostname": "agent-test.internal", "job_id": job_id, "exit_code": 0, "log_tail": ""},
+        headers=AUTH_HEADER,
+    )
+    assert resp.status_code == 409
+    assert any(c["action"] == "agent_restore_result_discarded_not_running" for c in _mock_audit)
+
+
+def test_restore_result_success_updates_job_and_preserves_source_job_id():
+    source_job_id = _insert_succeeded_apply_job_with_backup()
+    job_id = _insert_restore_job(status="running", source_job_id=source_job_id)
+
+    resp = client.post(
+        "/internal/agent/restore-result",
+        json={"hostname": "agent-test.internal", "job_id": job_id, "exit_code": 0, "log_tail": "restore ok"},
+        headers=AUTH_HEADER,
+    )
+    assert resp.status_code == 200
+
+    db = _TestSessionLocal()
+    job = db.get(Job, job_id)
+    assert job.status == "succeeded"
+    assert job.result_summary["source_job_id"] == source_job_id
+    assert job.result_summary["raw_log_tail"] == "restore ok"
+    assert job.result_summary["dispatch_via"] == "agent"
+    db.close()
+
+
+def test_restore_result_nonzero_exit_code_marks_failed():
+    job_id = _insert_restore_job(status="running", source_job_id=1)
+
+    resp = client.post(
+        "/internal/agent/restore-result",
+        json={"hostname": "agent-test.internal", "job_id": job_id, "exit_code": 1, "log_tail": "loi", "error": "sshd_config invalid"},
+        headers=AUTH_HEADER,
+    )
+    assert resp.status_code == 200
+
+    db = _TestSessionLocal()
+    job = db.get(Job, job_id)
+    assert job.status == "failed"
+    assert job.result_summary["error"] == "sshd_config invalid"
+    db.close()
 
 
 # ---- POST /internal/agent/remediation-bundle ----
@@ -1043,7 +1509,7 @@ def test_trigger_agent_install_requires_agent_manager_public_url_configured(monk
     assert "AGENT_MANAGER_PUBLIC_URL" in resp.json()["detail"]
 
 
-def test_trigger_agent_install_success(monkeypatch, _mock_audit):
+def test_trigger_agent_install_success(monkeypatch, _mock_audit, _mock_agent_install_background):
     monkeypatch.setattr(agents_module.settings, "agent_bundle_ref", "agent-v1-20260101T000000Z")
     monkeypatch.setattr(agents_module.settings, "agent_bundle_trusted_fingerprint", "TEST-FPR-1234")
     monkeypatch.setattr(agents_module.settings, "agent_manager_public_url", "https://192.0.2.1:8443")
@@ -1056,12 +1522,20 @@ def test_trigger_agent_install_success(monkeypatch, _mock_audit):
 
     assert resp.status_code == 202
     body = resp.json()
-    assert body["status"] == "succeeded"
+    # Response trả về NGAY lúc job còn "running" — _dispatch_agent_install_job
+    # (bị spy chặn ở _mock_agent_install_background) chạy phần chờ
+    # job-dispatcher trong BackgroundTasks, KHÔNG phản ánh vào response của
+    # chính request POST này.
+    assert body["status"] == "running"
     assert body["job_type"] == "agent-install"
+
+    assert len(_mock_agent_install_background) == 1
+    _real_dispatch_agent_install_job(*_mock_agent_install_background[0])
 
     db = _TestSessionLocal()
     job = db.get(Job, body["id"])
     db.close()
+    assert job.status == "succeeded"
     assert job.result_summary["agent_install_status"] == "ok"
     assert job.result_summary["exit_code"] == 0
 
@@ -1070,7 +1544,9 @@ def test_trigger_agent_install_success(monkeypatch, _mock_audit):
     assert completed[0]["payload"]["status"] == "succeeded"
 
 
-def test_trigger_agent_install_script_failure_returns_202_with_failed_job(monkeypatch):
+def test_trigger_agent_install_script_failure_returns_202_with_failed_job(
+    monkeypatch, _mock_agent_install_background
+):
     # Script chạy được (dispatcher không lỗi) nhưng exit_code != 0 (vd verify
     # chữ ký bundle thất bại trên execution-env) — job "failed" nhưng response
     # HTTP vẫn 202 (khác nhánh cert-mint/dispatcher lỗi hạ tầng, trả 502).
@@ -1089,7 +1565,14 @@ def test_trigger_agent_install_script_failure_returns_202_with_failed_job(monkey
 
     assert resp.status_code == 202
     body = resp.json()
-    assert body["status"] == "failed"
+    assert body["status"] == "running"
+
+    _real_dispatch_agent_install_job(*_mock_agent_install_background[0])
+
+    db = _TestSessionLocal()
+    job = db.get(Job, body["id"])
+    db.close()
+    assert job.status == "failed"
 
 
 def test_trigger_agent_install_cert_mint_failure_returns_502_and_marks_job_failed(monkeypatch, _mock_audit):
@@ -1098,10 +1581,10 @@ def test_trigger_agent_install_cert_mint_failure_returns_502_and_marks_job_faile
     monkeypatch.setattr(agents_module.settings, "agent_manager_public_url", "https://192.0.2.1:8443")
     _register_host(ca_migration_status="trust_deployed")
 
-    def _raise(principal):
+    def _raise(host, principal):
         raise RuntimeError("step-ca không phản hồi")
 
-    monkeypatch.setattr(agents_module, "mint_ssh_certificate", _raise)
+    monkeypatch.setattr(agents_module, "_get_ssh_dispatch_environment", _raise)
 
     app.dependency_overrides[get_current_user] = _as("opuser", "operator")
     resp = client.post("/hosts/agent-test.internal/agent-install")
@@ -1120,13 +1603,60 @@ def test_trigger_agent_install_cert_mint_failure_returns_502_and_marks_job_faile
     assert jobs[0].finished_at is not None
 
 
-def test_trigger_agent_install_dispatcher_failure_returns_502_and_marks_job_failed(monkeypatch, _mock_audit):
+def test_trigger_agent_install_enrollment_bookkeeping_failure_returns_502_and_marks_job_failed(
+    monkeypatch, _mock_audit
+):
+    # Trước đây _issue_agent_enrollment_token chỉ bọc create_agent_enrollment_
+    # token — pyjwt.decode/db.add/db.commit KHÔNG được bọc, nên 1 exception ở
+    # đó (vd lỗi decode, DB tạm thời không ghi được) lọt qua thẳng except
+    # HTTPException của trigger_agent_install, để Job kẹt MÃI ở "running".
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_ref", "agent-v1-20260101T000000Z")
+    monkeypatch.setattr(agents_module.settings, "agent_bundle_trusted_fingerprint", "TEST-FPR-1234")
+    monkeypatch.setattr(agents_module.settings, "agent_manager_public_url", "https://192.0.2.1:8443")
+    _register_host(ca_migration_status="trust_deployed")
+    monkeypatch.setattr(agents_module, "create_agent_enrollment_token", lambda hostname: _fake_ott())
+
+    def _raise_decode(*args, **kwargs):
+        raise ValueError("token decode hỏng (mô phỏng lỗi sổ sách bất ngờ)")
+
+    monkeypatch.setattr(agents_module.pyjwt, "decode", _raise_decode)
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-test.internal/agent-install")
+    _clear_user_override()
+
+    assert resp.status_code == 502
+
+    db = _TestSessionLocal()
+    jobs = db.query(Job).filter(Job.hostname == "agent-test.internal").all()
+    db.close()
+    assert len(jobs) == 1
+    assert jobs[0].status == "failed"
+    assert jobs[0].finished_at is not None
+
+    failed = [c for c in _mock_audit if c["action"] == "agent_install_failed"]
+    assert len(failed) == 1
+    assert failed[0]["payload"]["error"] == "enrollment_token_issue_failed"
+
+
+def test_trigger_agent_install_dispatcher_failure_marks_job_failed(
+    monkeypatch, _mock_audit, _mock_agent_install_background
+):
+    # Khác nhánh cert-mint/enrollment (lỗi tiền-dispatch, vẫn đồng bộ, vẫn
+    # 502 ngay) — lỗi gọi job-dispatcher xảy ra TRONG BackgroundTasks, nên
+    # response ban đầu vẫn 202/"running", chỉ Job cuối cùng mới "failed" sau
+    # khi background task chạy (gọi _real_dispatch_agent_install_job trực
+    # tiếp ở đây để quan sát, xem docstring _mock_agent_install_background).
     monkeypatch.setattr(agents_module.settings, "agent_bundle_ref", "agent-v1-20260101T000000Z")
     monkeypatch.setattr(agents_module.settings, "agent_bundle_trusted_fingerprint", "TEST-FPR-1234")
     monkeypatch.setattr(agents_module.settings, "agent_manager_public_url", "https://192.0.2.1:8443")
     _register_host(ca_migration_status="trust_deployed")
     monkeypatch.setattr(
-        agents_module, "mint_ssh_certificate", lambda principal: ("FAKE-PRIVATE-KEY", "FAKE-CERT-PUB")
+        agents_module, "_get_ssh_dispatch_environment",
+        lambda host, principal: {
+            "SSH_KEY_B64": base64.b64encode(b"FAKE-PRIVATE-KEY").decode(),
+            "SSH_CERT_B64": base64.b64encode(b"FAKE-CERT-PUB").decode(),
+        },
     )
     monkeypatch.setattr(
         jobs_module, "mint_agent_manager_server_cert",
@@ -1142,7 +1672,11 @@ def test_trigger_agent_install_dispatcher_failure_returns_502_and_marks_job_fail
     resp = client.post("/hosts/agent-test.internal/agent-install")
     _clear_user_override()
 
-    assert resp.status_code == 502
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "running"
+
+    _real_dispatch_agent_install_job(*_mock_agent_install_background[0])
+
     failed = [c for c in _mock_audit if c["action"] == "agent_install_failed"]
     assert len(failed) == 1
     assert failed[0]["payload"]["error"] == "dispatcher_call_failed"

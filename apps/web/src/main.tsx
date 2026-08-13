@@ -2,8 +2,11 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import CssBaseline from "@mui/material/CssBaseline";
+import { ThemeProvider } from "@mui/material/styles";
 import keycloak from "./auth/keycloak";
 import App from "./App";
+import theme from "./theme";
+import { SnackbarProvider } from "./hooks/useSnackbar";
 
 const rootEl = document.getElementById("root")!;
 
@@ -32,10 +35,16 @@ keycloak
     }
     createRoot(rootEl).render(
       <StrictMode>
-        <CssBaseline />
-        <BrowserRouter>
-          <App />
-        </BrowserRouter>
+        <ThemeProvider theme={theme}>
+          <CssBaseline />
+          {/* SnackbarProvider PHẢI bọc ngoài <App/> — mọi trang render qua
+              <Outlet> của Router và gọi useSnackbar() bên trong. */}
+          <SnackbarProvider>
+            <BrowserRouter>
+              <App />
+            </BrowserRouter>
+          </SnackbarProvider>
+        </ThemeProvider>
       </StrictMode>
     );
   })

@@ -27,23 +27,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit import write_audit_event
-from app.auth import CurrentUser, require_roles
+from app.auth import CurrentUser
 from app.db import SessionLocal
 from app.jobs import _find_remediation_variant, run_remediate_apply, run_remediate_dry_run
 from app.models import CanaryRollout, Control, Host, Job
+from app.permissions import CANARY_MANAGE, CANARY_VIEW
+from app.rbac import require_permission
 from app.schemas import CanaryRolloutDetailOut, CanaryRolloutHostOutcome, CanaryRolloutOut
 
 router = APIRouter(tags=["canary-rollout"])
 
 logger = logging.getLogger(__name__)
-
-# Trùng đúng giá trị _OPERATOR_ROLES ở app/jobs.py và app/hosts.py — duplicate
-# có chủ đích (không import), cùng lý do jobs.py tự duplicate
-# _REMEDIATE_HIGH_TIER_MAX từ hosts.py thay vì import: giữ policy "ai được
-# trigger remediate/canary" độc lập theo từng router, dễ tách rời sau này nếu
-# 1 router cần siết chặt hơn router kia mà không ảnh hưởng router còn lại.
-_OPERATOR_ROLES = ("operator", "admin")
-_ALL_ROLES = ("viewer", "auditor", "rule-editor", "approver", "operator", "admin")
 
 # Canary CHỈ chạy trên host Tier 2 — Tier 0/1 ("production/Tier cao", xem
 # app/hosts.py) luôn bắt buộc remediate thủ công từng host qua app/jobs.py,
@@ -290,7 +284,7 @@ def start_canary_rollout(
     background_tasks: BackgroundTasks,
     response: Response,
     db: Session = Depends(_get_db),
-    user: CurrentUser = Depends(require_roles(*_OPERATOR_ROLES)),
+    user: CurrentUser = Depends(require_permission(CANARY_MANAGE)),
 ) -> CanaryRollout:
     control = db.get(Control, control_id)
     if control is None:
@@ -367,7 +361,7 @@ def start_canary_rollout(
 def get_canary_rollout(
     rollout_id: int,
     db: Session = Depends(_get_db),
-    _user: CurrentUser = Depends(require_roles(*_ALL_ROLES)),
+    _user: CurrentUser = Depends(require_permission(CANARY_VIEW)),
 ) -> CanaryRolloutDetailOut:
     rollout = db.get(CanaryRollout, rollout_id)
     if rollout is None:
@@ -414,7 +408,7 @@ def get_canary_rollout(
 def cancel_canary_rollout(
     rollout_id: int,
     db: Session = Depends(_get_db),
-    _user: CurrentUser = Depends(require_roles(*_OPERATOR_ROLES)),
+    _user: CurrentUser = Depends(require_permission(CANARY_MANAGE)),
 ) -> CanaryRollout:
     rollout = db.get(CanaryRollout, rollout_id)
     if rollout is None:

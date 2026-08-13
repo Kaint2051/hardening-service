@@ -8,14 +8,20 @@ from pydantic import BaseModel
 
 from app.agents import router as agents_router
 from app.audit import verify_chain, write_audit_event
-from app.auth import CurrentUser, get_current_user, require_roles
+from app.auth import CurrentUser, get_current_user
 from app.canary import reconcile_orphaned_rollouts
 from app.canary import router as canary_router
 from app.config import settings
+from app.control_templates import router as control_templates_router
 from app.controls import router as controls_router
 from app.hosts import router as hosts_router
 from app.jobs import reconcile_orphaned_remediate_jobs
 from app.jobs import router as jobs_router
+from app.permissions import AUDIT_VERIFY, AUDIT_WRITE
+from app.rbac import require_permission
+from app.remediation_requests import router as remediation_requests_router
+from app.roles import router as roles_router
+from app.users import router as users_router
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +63,14 @@ app.add_middleware(
 )
 
 app.include_router(controls_router)
+app.include_router(control_templates_router)
 app.include_router(hosts_router)
 app.include_router(jobs_router)
 app.include_router(agents_router)
 app.include_router(canary_router)
+app.include_router(remediation_requests_router)
+app.include_router(users_router)
+app.include_router(roles_router)
 
 
 @app.get("/healthz")
@@ -71,6 +81,24 @@ def healthz() -> dict:
 @app.get("/me")
 def whoami(user: CurrentUser = Depends(get_current_user)) -> dict:
     return {"username": user.username, "roles": sorted(user.roles)}
+
+
+@app.get("/runtime-config")
+def runtime_config(_user: CurrentUser = Depends(get_current_user)) -> dict:
+    """Cờ cấu hình phía server mà UI PHẢI biết mới hiển thị đúng sự thật —
+    hiện chỉ có kill-switch TOÀN CỤC Active Response (app/config.py).
+
+    Lý do tồn tại: cột "Kết nối" ở trang Hosts suy kênh remediate (SSH hay
+    Agent) từ 3 cờ trên chính Host, nhưng app/jobs.py:_agent_ineligible_reason
+    còn kiểm tra ĐIỀU KIỆN THỨ 4 này. Thiếu nó, UI sẽ báo "Agent" cho 1 host
+    đã bật active_response_enabled trong khi thực tế mọi remediate vẫn đi
+    đường SSH — đúng loại "UI nói dối" mà dự án này tránh (không tin UI để
+    enforce, nhưng UI cũng không được mô tả sai trạng thái thật).
+
+    CHỈ ĐỌC, không có gì nhạy cảm (1 boolean đã ghi rõ trong .env.example) —
+    mở cho mọi role đã đăng nhập, cùng mức GET /hosts.
+    """
+    return {"active_response_enabled": settings.active_response_enabled}
 
 
 class AuditEventIn(BaseModel):
@@ -84,7 +112,7 @@ class AuditEventIn(BaseModel):
 # đây là gap bảo mật thật đã sửa so với bản demo Giai đoạn 0.
 @app.post("/internal/audit-events")
 def create_audit_event(
-    event: AuditEventIn, user: CurrentUser = Depends(require_roles("admin"))
+    event: AuditEventIn, user: CurrentUser = Depends(require_permission(AUDIT_WRITE))
 ) -> dict:
     entry = write_audit_event(
         actor=user.username,
@@ -101,6 +129,6 @@ def create_audit_event(
 
 @app.get("/internal/audit-events/verify")
 def verify_audit_chain(
-    _user: CurrentUser = Depends(require_roles("auditor", "admin"))
+    _user: CurrentUser = Depends(require_permission(AUDIT_VERIFY))
 ) -> dict:
     return {"chain_intact": verify_chain()}

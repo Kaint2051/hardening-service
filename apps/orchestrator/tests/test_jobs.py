@@ -2,6 +2,13 @@
 và lệnh gọi job-dispatcher (httpx.post) để test logic RBAC/luồng job mà
 không cần step-ca/job-dispatcher thật chạy. Việc dispatcher/scan.sh có chạy
 đúng thật hay không được verify riêng trên lab server (không phải ở unit test)."""
+import base64
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -11,11 +18,25 @@ from sqlalchemy.pool import StaticPool
 
 from datetime import datetime, timedelta, timezone
 
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import padding as sym_padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
 from app import jobs as jobs_module
 from app.auth import CurrentUser, get_current_user
 from app.db import Base
 from app.main import app
 from app.models import Control, Host, Job, RemediationVariant
+from app.secrets_crypto import encrypt_host_secret
+
+# Giữ tham chiếu hàm THẬT TRƯỚC khi bất kỳ fixture nào monkeypatch
+# jobs_module._dispatch_ssh_check_job thành spy/no-op (xem fixture
+# _mock_ssh_check_background bên dưới, cùng GOTCHA #2 trong docstring đầu
+# test_canary.py) — dùng để tự gọi trực tiếp, đồng bộ, khi 1 test cần quan
+# sát kết quả cuối của phần chạy trong BackgroundTasks.
+_real_dispatch_ssh_check_job = jobs_module._dispatch_ssh_check_job
 
 _engine = create_engine(
     "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
@@ -73,6 +94,7 @@ def _clear_user_override():
 def _register_host(
     hostname="scan-target.internal", tier=2, os_family="Ubuntu", os_version="22.04",
     ca_migration_status="not_started", decommissioned=False, ssh_user="root",
+    static_ssh_private_key_encrypted=None,
 ):
     db = _TestSessionLocal()
     db.add(Host(
@@ -85,10 +107,19 @@ def _register_host(
         ca_migration_status=ca_migration_status,
         decommissioned_at=datetime.now(timezone.utc) if decommissioned else None,
         decommissioned_by="opuser" if decommissioned else None,
+        static_ssh_private_key_encrypted=static_ssh_private_key_encrypted,
         added_by="opuser",
     ))
     db.commit()
     db.close()
+
+
+def _get_host(hostname="scan-target.internal") -> Host:
+    db = _TestSessionLocal()
+    host = db.get(Host, hostname)
+    db.expunge(host)
+    db.close()
+    return host
 
 
 def _register_control(control_id="ctrl-1", maturity="production"):
@@ -110,6 +141,35 @@ def _register_remediation_variant(
     ))
     db.commit()
     db.close()
+
+
+@pytest.fixture(autouse=True)
+def _mock_encryption_key(monkeypatch):
+    # Cần cho các test static-SSH-key (encrypt_host_secret/decrypt_host_secret)
+    # — không ảnh hưởng test khác trong file này (không test nào khác đụng
+    # tới secret nào của Host), cùng pattern test_hosts.py.
+    monkeypatch.setattr(jobs_module.settings, "host_credential_encryption_key", Fernet.generate_key().decode())
+
+
+@pytest.fixture(autouse=True)
+def _mock_ssh_check_dispatch(monkeypatch):
+    # trigger_ssh_check giờ chạy phần chờ job-dispatcher qua BackgroundTasks
+    # (_dispatch_ssh_check_job, mở SessionLocal() RIÊNG — KHÔNG qua
+    # Depends(_get_db)) — 2 việc PHẢI làm cùng lúc cho MỌI test trong file
+    # này (không chỉ test ssh-check), cùng gotcha đã giải quyết cho
+    # canary.py (xem docstring đầu test_canary.py):
+    #   1. Trỏ jobs_module.SessionLocal về engine SQLite test — nếu không,
+    #      TestClient tự chạy BackgroundTasks thật trong CÙNG lần gọi
+    #      client.post(...), _dispatch_ssh_check_job sẽ cố nối Postgres thật.
+    #   2. Thay _dispatch_ssh_check_job bằng spy ghi lại args (KHÔNG chạy
+    #      thật) — response POST luôn serialize lúc job còn "running" (TRƯỚC
+    #      khi background task chạy), nên resp.json()["status"] KHÔNG BAO
+    #      GIỜ phản ánh kết quả cuối; test cần xem kết quả cuối tự gọi lại
+    #      _real_dispatch_ssh_check_job(*args) đồng bộ.
+    monkeypatch.setattr(jobs_module, "SessionLocal", _TestSessionLocal)
+    calls = []
+    monkeypatch.setattr(jobs_module, "_dispatch_ssh_check_job", lambda *a: calls.append(a))
+    return calls
 
 
 @pytest.fixture(autouse=True)
@@ -293,6 +353,23 @@ def test_successful_scan_accepts_debian_profile_key(monkeypatch):
     assert resp.json()["status"] == "succeeded"
 
 
+def test_successful_scan_accepts_ubuntu_stig_profile_key(monkeypatch):
+    # Hồi quy cho SCAP_PROFILES thêm entry "ubuntu2204-stig" (datastream
+    # riêng vendor từ ComplianceAsCode v0.1.81, KHÔNG phải gói apt
+    # ssg-debderived — xem comment tại app/jobs.py:SCAP_PROFILES) — chỉ cần
+    # xác nhận key mới không bị 422 do gõ sai chuỗi profile id, cơ chế dispatch
+    # giống hệt test_successful_scan_updates_job.
+    _register_host()
+    _mock_dispatcher_success(monkeypatch, exit_code=0)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/scan", json={"scap_profile_key": "ubuntu2204-stig"}
+    )
+    _clear_user_override()
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "succeeded"
+
+
 def test_scan_parses_per_rule_findings(monkeypatch):
     _register_host()
     logs = (
@@ -384,7 +461,7 @@ def test_ssh_check_blocked_when_decommissioned():
     assert resp.status_code == 422
 
 
-def test_ssh_check_success_when_trust_deployed(monkeypatch):
+def test_ssh_check_success_when_trust_deployed(monkeypatch, _mock_ssh_check_dispatch):
     _register_host(ca_migration_status="trust_deployed")
     _mock_dispatcher_success(
         monkeypatch, exit_code=0, logs="SSH_CHECK_STATUS=ok\nSSH_CHECK_UNAME=Linux test 6.8.0\n"
@@ -395,12 +472,23 @@ def test_ssh_check_success_when_trust_deployed(monkeypatch):
     assert resp.status_code == 202
     body = resp.json()
     assert body["job_type"] == "ssh-check"
-    assert body["status"] == "succeeded"
-    assert body["result_summary"]["ssh_check_status"] == "ok"
-    assert "Linux test" in body["result_summary"]["ssh_check_uname"]
+    # Response trả về NGAY lúc job còn "running" — _dispatch_ssh_check_job
+    # (bị spy chặn ở trên) chạy phần chờ job-dispatcher trong BackgroundTasks,
+    # KHÔNG phản ánh vào response của chính request POST này.
+    assert body["status"] == "running"
+
+    assert len(_mock_ssh_check_dispatch) == 1
+    _real_dispatch_ssh_check_job(*_mock_ssh_check_dispatch[0])
+
+    db = _TestSessionLocal()
+    job = db.get(Job, body["id"])
+    db.close()
+    assert job.status == "succeeded"
+    assert job.result_summary["ssh_check_status"] == "ok"
+    assert "Linux test" in job.result_summary["ssh_check_uname"]
 
 
-def test_ssh_check_success_when_migrated(monkeypatch):
+def test_ssh_check_success_when_migrated(monkeypatch, _mock_ssh_check_dispatch):
     # "migrated" cũng hợp lệ, không chỉ "trust_deployed" — cả 2 trạng thái
     # đều đã tin CA (khác biệt duy nhất là revoke credential cũ hay chưa).
     _register_host(ca_migration_status="migrated")
@@ -411,17 +499,33 @@ def test_ssh_check_success_when_migrated(monkeypatch):
     resp = client.post("/hosts/scan-target.internal/ssh-check")
     _clear_user_override()
     assert resp.status_code == 202
-    assert resp.json()["status"] == "succeeded"
+    body = resp.json()
+    assert body["status"] == "running"
+
+    _real_dispatch_ssh_check_job(*_mock_ssh_check_dispatch[0])
+
+    db = _TestSessionLocal()
+    job = db.get(Job, body["id"])
+    db.close()
+    assert job.status == "succeeded"
 
 
-def test_ssh_check_failure_marks_job_failed(monkeypatch):
+def test_ssh_check_failure_marks_job_failed(monkeypatch, _mock_ssh_check_dispatch):
     _register_host(ca_migration_status="trust_deployed")
     _mock_dispatcher_success(monkeypatch, exit_code=1, logs="SSH_CHECK_STATUS=failed\n")
     app.dependency_overrides[get_current_user] = _as("opuser", "operator")
     resp = client.post("/hosts/scan-target.internal/ssh-check")
     _clear_user_override()
     assert resp.status_code == 202
-    assert resp.json()["status"] == "failed"
+    body = resp.json()
+    assert body["status"] == "running"
+
+    _real_dispatch_ssh_check_job(*_mock_ssh_check_dispatch[0])
+
+    db = _TestSessionLocal()
+    job = db.get(Job, body["id"])
+    db.close()
+    assert job.status == "failed"
 
 
 def test_ssh_check_cert_mint_failure_marks_job_failed(monkeypatch, _mock_cert):
@@ -554,9 +658,9 @@ def test_ca_bootstrap_success_sets_trust_deployed_and_updated_by(monkeypatch):
     host = db.get(Host, "scan-target.internal")
     db.close()
     assert host.ca_migration_status == "trust_deployed"
-    # PHẢI set updated_by = người vừa chạy job này — nếu để None sẽ vô tình
-    # tắt hẳn four-eyes lúc xác nhận "migrated" sau này cho Tier cao (cùng
-    # lớp bug đã tìm thấy và vá trước đây, xem README.md).
+    # PHẢI set updated_by = người vừa chạy job này — giữ nhất quán dữ liệu
+    # với PATCH /hosts/{hostname}/ca-migration-status thủ công (audit trail,
+    # không còn gate gì cả — four-eyes cho bước "migrated" đã bị bỏ).
     assert host.ca_migration_updated_by == "opuser"
 
 
@@ -635,6 +739,28 @@ _REMEDIATE_APPLY_LOGS_WITH_BACKUP = (
 )
 
 
+def _mock_dispatcher_capturing(monkeypatch, logs=_REMEDIATE_LOGS, exit_code=0):
+    """Giống _mock_dispatcher_success nhưng còn lưu lại request body — dùng
+    khi test cần kiểm tra nội dung `environment` truyền xuống execution-env
+    (REMEDIATION_REF, EXTRA_VARS_JSON...), không chỉ mã trạng thái job."""
+    captured = {}
+
+    def _fake_post(*args, **kwargs):
+        captured["json"] = kwargs["json"]
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"job_id": "1", "exit_code": exit_code, "logs": logs}
+
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    return captured
+
+
 def _do_dry_run(monkeypatch, hostname="scan-target.internal", control_id="ctrl-1", username="opuser"):
     _mock_dispatcher_success(monkeypatch, exit_code=0, logs=_REMEDIATE_LOGS)
     app.dependency_overrides[get_current_user] = _as(username, "operator")
@@ -692,6 +818,22 @@ def test_remediate_dry_run_no_matching_variant_404():
     assert resp.status_code == 404
 
 
+def test_remediate_dry_run_unknown_os_family_gives_clear_422_not_404():
+    # Host chưa cài Agent lẫn chưa ai PATCH os_family tay (os_family=None,
+    # xem app/schemas.py:HostCreate không còn field này lúc đăng ký) — PHẢI
+    # báo lỗi riêng "chưa xác định OS" (422), KHÔNG lọt xuống nhánh 404
+    # "không tìm thấy RemediationVariant khớp None" (dễ hiểu lầm là do THIẾU
+    # khai RemediationVariant cho distro đó, nguyên nhân thật khác hẳn).
+    _register_host(os_family=None, os_version=None)
+    _register_control()
+    _register_remediation_variant(os_family="Ubuntu", os_version="22.04")
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/controls/ctrl-1/remediate/dry-run")
+    _clear_user_override()
+    assert resp.status_code == 422
+    assert "chưa xác định OS" in resp.json()["detail"]
+
+
 def test_remediate_dry_run_matches_wildcard_os_version_variant(monkeypatch):
     # RemediationVariant.os_version=None nghĩa là "mọi version của os_family
     # này" — vẫn phải khớp được dù host có os_version cụ thể.
@@ -744,27 +886,89 @@ def test_remediate_dry_run_picks_debian_variant_not_ubuntu_when_both_registered(
     _register_remediation_variant(os_family="Ubuntu", os_version="22.04", remediation_ref="ubuntu-bundle")
     _register_remediation_variant(os_family="Debian", os_version="11", remediation_ref="debian-bundle-1")
 
-    captured = {}
-
-    def _fake_post(*args, **kwargs):
-        captured["json"] = kwargs["json"]
-
-        class _FakeResponse:
-            def raise_for_status(self):
-                pass
-
-            def json(self):
-                return {"job_id": "1", "exit_code": 0, "logs": _REMEDIATE_LOGS}
-
-        return _FakeResponse()
-
-    monkeypatch.setattr(httpx, "post", _fake_post)
+    captured = _mock_dispatcher_capturing(monkeypatch)
     app.dependency_overrides[get_current_user] = _as("opuser", "operator")
     resp = client.post("/hosts/debian-target.internal/controls/ctrl-1/remediate/dry-run")
     _clear_user_override()
 
     assert resp.status_code == 202
     assert captured["json"]["environment"]["REMEDIATION_REF"] == "debian-bundle-1"
+
+
+# ---- Override biến Ansible riêng theo host (Host.ansible_var_overrides x
+# Control.overridable_variables), xem app/jobs.py:_dispatch_remediate_job_via_ssh ----
+
+
+def test_remediate_dry_run_passes_only_overrides_intersecting_control_variables(monkeypatch):
+    # "unrelated_var" KHÔNG thuộc overridable_variables của control đang chạy
+    # (có thể là override còn sót từ 1 Control/template khác trùng tên biến
+    # host) — phải bị lọc bỏ, chỉ "sshd_banner_text" được truyền xuống.
+    _register_host()
+    _register_control()
+    _register_remediation_variant()
+
+    db = _TestSessionLocal()
+    control = db.get(Control, "ctrl-1")
+    control.overridable_variables = {"sshd_banner_text": "Default banner"}
+    host = db.get(Host, "scan-target.internal")
+    host.ansible_var_overrides = {"sshd_banner_text": "Custom banner", "unrelated_var": "nope"}
+    db.commit()
+    db.close()
+
+    captured = _mock_dispatcher_capturing(monkeypatch)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/controls/ctrl-1/remediate/dry-run")
+    _clear_user_override()
+
+    assert resp.status_code == 202
+    extra_vars = json.loads(captured["json"]["environment"]["EXTRA_VARS_JSON"])
+    assert extra_vars == {"sshd_banner_text": "Custom banner"}
+
+
+def test_remediate_dry_run_extra_vars_empty_when_host_has_no_overrides(monkeypatch):
+    # Host không override gì (mặc định cột JSON là {}) — EXTRA_VARS_JSON phải
+    # là chuỗi "{}" hợp lệ (KHÔNG rỗng/None), vì remediate.sh coi biến này là
+    # bắt buộc (": ${EXTRA_VARS_JSON:?...}") dù không có override nào.
+    _register_host()
+    _register_control()
+    _register_remediation_variant()
+
+    db = _TestSessionLocal()
+    control = db.get(Control, "ctrl-1")
+    control.overridable_variables = {"sshd_banner_text": "Default banner"}
+    db.commit()
+    db.close()
+
+    captured = _mock_dispatcher_capturing(monkeypatch)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/controls/ctrl-1/remediate/dry-run")
+    _clear_user_override()
+
+    assert resp.status_code == 202
+    assert captured["json"]["environment"]["EXTRA_VARS_JSON"] == "{}"
+
+
+def test_remediate_dry_run_extra_vars_empty_when_control_not_from_template(monkeypatch):
+    # Control tạo thủ công (POST /controls) luôn có overridable_variables
+    # rỗng — dù host tình cờ có sẵn override cho 1 biến nào đó (từ Control
+    # khác), KHÔNG được áp nhầm sang playbook của Control đang chạy đây.
+    _register_host()
+    _register_control()
+    _register_remediation_variant()
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "scan-target.internal")
+    host.ansible_var_overrides = {"sshd_banner_text": "Custom banner"}
+    db.commit()
+    db.close()
+
+    captured = _mock_dispatcher_capturing(monkeypatch)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/controls/ctrl-1/remediate/dry-run")
+    _clear_user_override()
+
+    assert resp.status_code == 202
+    assert captured["json"]["environment"]["EXTRA_VARS_JSON"] == "{}"
 
 
 def test_remediate_dry_run_success_sets_control_and_variant(monkeypatch):
@@ -874,22 +1078,31 @@ def test_remediate_apply_blocks_stale_dry_run(monkeypatch):
     assert "quá hạn" in resp.json()["detail"]
 
 
-def test_remediate_apply_four_eyes_blocks_same_user_on_tier0(monkeypatch):
+def test_remediate_apply_allows_same_user_on_tier0_after_four_eyes_removed(monkeypatch):
+    """Four-eyes (chặn người vừa dry-run tự apply cho host Tier 0/1) đã bị bỏ
+    theo yêu cầu người dùng — opuser tự apply trên host Tier 0 phải thành
+    công."""
     _register_host(tier=0)
     _register_control()
     _register_remediation_variant()
     dry_run_id = _succeeded_dry_run_job_id(monkeypatch, username="opuser")
 
+    _mock_dispatcher_success(monkeypatch, exit_code=0, logs=_REMEDIATE_APPLY_LOGS_WITH_BACKUP)
     app.dependency_overrides[get_current_user] = _as("opuser", "operator")
     resp = client.post(
         "/hosts/scan-target.internal/controls/ctrl-1/remediate/apply",
         json={"dry_run_job_id": dry_run_id},
     )
     _clear_user_override()
-    assert resp.status_code == 403
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["job_type"] == "remediate-apply"
+    assert body["status"] == "succeeded"
+    assert body["result_summary"]["backup_tar_b64"] == "ZmFrZS1iYWNrdXAtdGFyLWNvbnRlbnQ="
+    assert body["result_summary"]["backup_truncated"] is False
 
 
-def test_remediate_apply_four_eyes_allows_different_user_on_tier0(monkeypatch):
+def test_remediate_apply_allows_different_user_on_tier0(monkeypatch):
     _register_host(tier=0)
     _register_control()
     _register_remediation_variant()
@@ -910,8 +1123,9 @@ def test_remediate_apply_four_eyes_allows_different_user_on_tier0(monkeypatch):
     assert body["result_summary"]["backup_truncated"] is False
 
 
-def test_remediate_apply_no_four_eyes_required_on_tier2_same_user(monkeypatch):
-    # Tier 2 (mặc định) — người dry-run được tự apply, KHÔNG cần người thứ 2.
+def test_remediate_apply_succeeds_on_tier2_same_user(monkeypatch):
+    # Tier 2 (mặc định) — người dry-run được tự apply, chưa từng cần người
+    # thứ 2 (kể cả trước khi bỏ four-eyes, tier2 vốn ngoài phạm vi áp dụng).
     _register_host(tier=2)
     _register_control()
     _register_remediation_variant()
@@ -1243,6 +1457,144 @@ def test_restore_failed_dispatch_marks_job_failed(monkeypatch):
     assert resp.status_code == 502
 
 
+# ---- restore qua Agent Active Response (app/jobs.py:_dispatch_restore_job_via_agent) ----
+
+
+def _make_succeeded_apply_job_with_backup(hostname, backup_b64="ZmFrZS1iYWNrdXAtdGFyLWNvbnRlbnQ="):
+    """Tạo TRỰC TIẾP qua ORM (không qua HTTP dry-run/apply) — nguồn gốc
+    backup không liên quan gì tới việc TEST restore, tránh phải lo host có
+    đủ điều kiện Agent hay không lúc tạo job apply gốc."""
+    db = _TestSessionLocal()
+    job = Job(
+        hostname=hostname, job_type="remediate-apply", status="succeeded", triggered_by="opuser",
+        started_at=datetime.now(timezone.utc), finished_at=datetime.now(timezone.utc),
+        result_summary={"backup_tar_b64": backup_b64, "backup_truncated": False, "exit_code": 0},
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    job_id = job.id
+    db.close()
+    return job_id
+
+
+def _make_restore_report_on_sleep(monkeypatch, hostname, exit_code=0, log_tail="restore ok qua agent", error=None):
+    """Mirror _make_agent_report_on_sleep — giữ NGUYÊN source_job_id đã lưu
+    tạm lúc _dispatch_restore_job_via_agent chuyển job "pending" (khác
+    _make_agent_report_on_sleep, vốn không có field này)."""
+
+    def _fake_sleep(_seconds):
+        db = _TestSessionLocal()
+        job = (
+            db.query(Job)
+            .filter(Job.hostname == hostname, Job.job_type == "restore", Job.status.in_(("pending", "running")))
+            .order_by(Job.id.desc())
+            .first()
+        )
+        if job is not None:
+            source_job_id = (job.result_summary or {}).get("source_job_id")
+            summary = {
+                "raw_log_tail": log_tail, "exit_code": exit_code,
+                "source_job_id": source_job_id, "dispatch_via": "agent",
+            }
+            if error is not None:
+                summary["error"] = error
+            job.status = "succeeded" if exit_code == 0 else "failed"
+            job.result_summary = summary
+            job.finished_at = datetime.now(timezone.utc)
+            db.commit()
+        db.close()
+
+    monkeypatch.setattr(jobs_module.time, "sleep", _fake_sleep)
+
+
+def test_restore_dispatches_via_agent_when_eligible(monkeypatch):
+    _register_agent_ready_host(monkeypatch, hostname="agent-restore.internal")
+    apply_job_id = _make_succeeded_apply_job_with_backup("agent-restore.internal")
+    monkeypatch.setattr(httpx, "post", _fail_if_dispatcher_called)
+    _make_restore_report_on_sleep(monkeypatch, "agent-restore.internal")
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-restore.internal/restore", json={"source_job_id": apply_job_id})
+    _clear_user_override()
+
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["status"] == "succeeded"
+    assert body["result_summary"]["dispatch_via"] == "agent"
+    assert body["result_summary"]["source_job_id"] == apply_job_id
+
+
+def test_restore_connection_method_agent_fails_fast_when_ineligible(monkeypatch):
+    _register_host(hostname="ssh-only-restore.internal")
+    apply_job_id = _make_succeeded_apply_job_with_backup("ssh-only-restore.internal")
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/ssh-only-restore.internal/restore",
+        json={"source_job_id": apply_job_id, "connection_method": "agent"},
+    )
+    _clear_user_override()
+
+    assert resp.status_code == 422
+    assert "agent" in resp.json()["detail"].lower()
+
+    db = _TestSessionLocal()
+    job = (
+        db.query(Job)
+        .filter(Job.hostname == "ssh-only-restore.internal", Job.job_type == "restore")
+        .order_by(Job.id.desc())
+        .first()
+    )
+    assert job.status == "failed"
+    assert job.result_summary["error"] == "agent_connection_method_unavailable"
+    db.close()
+
+
+def test_restore_connection_method_ssh_forces_ssh_even_when_agent_eligible(monkeypatch):
+    _register_agent_ready_host(monkeypatch, hostname="agent-restore-forced-ssh.internal")
+    apply_job_id = _make_succeeded_apply_job_with_backup("agent-restore-forced-ssh.internal")
+    _mock_dispatcher_success(monkeypatch, exit_code=0, logs="restore ok qua ssh")
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/agent-restore-forced-ssh.internal/restore",
+        json={"source_job_id": apply_job_id, "connection_method": "ssh"},
+    )
+    _clear_user_override()
+
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["status"] == "succeeded"
+    # Đường SSH KHÔNG set "dispatch_via" (hành vi cũ, giữ nguyên) — chỉ cần
+    # xác nhận KHÔNG bị đẩy qua Agent dù host đủ điều kiện.
+    assert body["result_summary"].get("dispatch_via") != "agent"
+
+
+def test_restore_via_agent_times_out_if_never_reported(monkeypatch):
+    _register_agent_ready_host(monkeypatch, hostname="agent-restore-timeout.internal")
+    apply_job_id = _make_succeeded_apply_job_with_backup("agent-restore-timeout.internal")
+    monkeypatch.setattr(jobs_module, "AGENT_REMEDIATE_DISPATCH_TIMEOUT", -1)
+    monkeypatch.setattr(jobs_module.time, "sleep", lambda _s: None)
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/agent-restore-timeout.internal/restore", json={"source_job_id": apply_job_id})
+    _clear_user_override()
+
+    assert resp.status_code == 504
+
+    db = _TestSessionLocal()
+    job = (
+        db.query(Job)
+        .filter(Job.hostname == "agent-restore-timeout.internal", Job.job_type == "restore")
+        .order_by(Job.id.desc())
+        .first()
+    )
+    assert job.status == "failed"
+    assert job.result_summary["error"] == "agent_restore_timeout"
+    db.close()
+
+
 # ---- POST /internal/job-dispatcher/server-cert (mTLS Giai đoạn 2) ----
 
 
@@ -1285,6 +1637,87 @@ def test_job_dispatcher_server_cert_upstream_failure_502(monkeypatch):
     resp = client.post(
         "/internal/job-dispatcher/server-cert", headers={"Authorization": "Bearer correct-secret"}
     )
+    assert resp.status_code == 502
+
+
+# ---- POST /internal/keycloak/server-cert, /internal/web/server-cert
+# (mục "Dựng TLS thật cho Keycloak/Orchestrator/Web") ----
+
+
+def test_keycloak_server_cert_requires_shared_secret():
+    resp = client.post("/internal/keycloak/server-cert")
+    assert resp.status_code == 401
+
+
+def test_keycloak_server_cert_wrong_secret_401(monkeypatch):
+    monkeypatch.setattr(jobs_module.settings, "keycloak_tls_shared_secret", "correct-secret")
+    resp = client.post("/internal/keycloak/server-cert", headers={"Authorization": "Bearer wrong-secret"})
+    assert resp.status_code == 401
+
+
+def test_keycloak_server_cert_success_passes_public_host_as_extra_san(monkeypatch):
+    monkeypatch.setattr(jobs_module.settings, "keycloak_tls_shared_secret", "correct-secret")
+    monkeypatch.setattr(jobs_module.settings, "public_host", "172.30.2.111")
+    calls = []
+
+    def _fake_mint(subject, extra_sans=None):
+        calls.append((subject, extra_sans))
+        return "FAKE-KC-CERT-PEM", "FAKE-KC-KEY-PEM"
+
+    monkeypatch.setattr(jobs_module, "mint_agent_manager_server_cert", _fake_mint)
+    resp = client.post("/internal/keycloak/server-cert", headers={"Authorization": "Bearer correct-secret"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cert_pem"] == "FAKE-KC-CERT-PEM"
+    assert body["key_pem"] == "FAKE-KC-KEY-PEM"
+    assert len(body["ca_root_pem"]) > 0
+    assert calls == [("keycloak", ["172.30.2.111"])]
+
+
+def test_keycloak_server_cert_upstream_failure_502(monkeypatch):
+    monkeypatch.setattr(jobs_module.settings, "keycloak_tls_shared_secret", "correct-secret")
+
+    def _boom(subject, extra_sans=None):
+        raise RuntimeError("step-ca không phản hồi")
+
+    monkeypatch.setattr(jobs_module, "mint_agent_manager_server_cert", _boom)
+    resp = client.post("/internal/keycloak/server-cert", headers={"Authorization": "Bearer correct-secret"})
+    assert resp.status_code == 502
+
+
+def test_web_server_cert_requires_shared_secret():
+    resp = client.post("/internal/web/server-cert")
+    assert resp.status_code == 401
+
+
+def test_web_server_cert_wrong_secret_401(monkeypatch):
+    monkeypatch.setattr(jobs_module.settings, "web_tls_shared_secret", "correct-secret")
+    resp = client.post("/internal/web/server-cert", headers={"Authorization": "Bearer wrong-secret"})
+    assert resp.status_code == 401
+
+
+def test_web_server_cert_success(monkeypatch):
+    monkeypatch.setattr(jobs_module.settings, "web_tls_shared_secret", "correct-secret")
+    monkeypatch.setattr(jobs_module.settings, "public_host", "172.30.2.111")
+    monkeypatch.setattr(
+        jobs_module, "mint_agent_manager_server_cert",
+        lambda subject, extra_sans=None: ("FAKE-WEB-CERT-PEM", "FAKE-WEB-KEY-PEM"),
+    )
+    resp = client.post("/internal/web/server-cert", headers={"Authorization": "Bearer correct-secret"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cert_pem"] == "FAKE-WEB-CERT-PEM"
+    assert body["key_pem"] == "FAKE-WEB-KEY-PEM"
+
+
+def test_web_server_cert_upstream_failure_502(monkeypatch):
+    monkeypatch.setattr(jobs_module.settings, "web_tls_shared_secret", "correct-secret")
+
+    def _boom(subject, extra_sans=None):
+        raise RuntimeError("step-ca không phản hồi")
+
+    monkeypatch.setattr(jobs_module, "mint_agent_manager_server_cert", _boom)
+    resp = client.post("/internal/web/server-cert", headers={"Authorization": "Bearer correct-secret"})
     assert resp.status_code == 502
 
 
@@ -1508,6 +1941,103 @@ def test_remediate_apply_dispatches_via_agent_with_backup(monkeypatch):
     assert body["result_summary"]["backup_truncated"] is False
 
 
+# ---- (b2) connection_method chọn tay — ép kênh, KHÔNG tự rơi về SSH khi
+# chọn "agent" mà thiếu điều kiện (khác nhánh tự động ở (a) phía trên) ----
+
+
+def test_remediate_dry_run_connection_method_ssh_forces_ssh_even_when_agent_eligible(monkeypatch):
+    # Host ĐỦ điều kiện agent (mặc định sẽ tự chọn agent nếu không chỉ định
+    # connection_method) — nhưng chọn tay "ssh" phải THẮNG, không đi Agent.
+    _register_agent_ready_host(monkeypatch)
+    _register_control()
+    _register_remediation_variant(os_family="Ubuntu", os_version="22.04")
+    _mock_dispatcher_success(monkeypatch, exit_code=0, logs=_REMEDIATE_LOGS)
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/agent-target.internal/controls/ctrl-1/remediate/dry-run",
+        json={"connection_method": "ssh"},
+    )
+    _clear_user_override()
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["result_summary"]["dispatch_via"] == "ssh"
+
+
+def test_remediate_dry_run_connection_method_agent_errors_422_when_ineligible(monkeypatch):
+    # Host THƯỜNG (chưa enroll Agent) — chọn tay "agent" phải báo 422 rõ
+    # ràng, KHÔNG được lặng lẽ rơi về SSH (khác hành vi tự động ở (a)).
+    _register_host(hostname="plain-host.internal")
+    _register_control()
+    _register_remediation_variant(os_family="Ubuntu", os_version="22.04")
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/plain-host.internal/controls/ctrl-1/remediate/dry-run",
+        json={"connection_method": "agent"},
+    )
+    _clear_user_override()
+
+    assert resp.status_code == 422
+    assert "Agent" in resp.json()["detail"]
+
+    db = _TestSessionLocal()
+    job = (
+        db.query(Job)
+        .filter(Job.hostname == "plain-host.internal", Job.job_type == "remediate-dry-run")
+        .order_by(Job.id.desc())
+        .first()
+    )
+    db.close()
+    assert job.status == "failed"
+    assert job.result_summary["error"] == "agent_connection_method_unavailable"
+
+
+def test_remediate_dry_run_connection_method_agent_succeeds_when_eligible(monkeypatch):
+    _register_agent_ready_host(monkeypatch)
+    _register_control()
+    _register_remediation_variant(os_family="Ubuntu", os_version="22.04")
+    monkeypatch.setattr(httpx, "post", _fail_if_dispatcher_called)
+    _make_agent_report_on_sleep(monkeypatch, "agent-target.internal", "remediate-dry-run")
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/agent-target.internal/controls/ctrl-1/remediate/dry-run",
+        json={"connection_method": "agent"},
+    )
+    _clear_user_override()
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["result_summary"]["dispatch_via"] == "agent"
+
+
+def test_remediate_apply_connection_method_ssh_forces_ssh_even_when_agent_eligible(monkeypatch):
+    _register_agent_ready_host(monkeypatch)
+    _register_control()
+    _register_remediation_variant(os_family="Ubuntu", os_version="22.04")
+    monkeypatch.setattr(httpx, "post", _fail_if_dispatcher_called)
+    _make_agent_report_on_sleep(monkeypatch, "agent-target.internal", "remediate-dry-run")
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    dry_run_id = client.post(
+        "/hosts/agent-target.internal/controls/ctrl-1/remediate/dry-run"
+    ).json()["id"]
+    _clear_user_override()
+
+    # Apply CHỌN TAY "ssh" — dry-run trước đó đi Agent (mặc định) không ràng
+    # buộc gì tới lựa chọn của apply, mỗi lần gọi tự chọn kênh riêng.
+    _mock_dispatcher_success(monkeypatch, exit_code=0, logs=_REMEDIATE_LOGS)
+    app.dependency_overrides[get_current_user] = _as("second-operator", "operator")
+    resp = client.post(
+        "/hosts/agent-target.internal/controls/ctrl-1/remediate/apply",
+        json={"dry_run_job_id": dry_run_id, "connection_method": "ssh"},
+    )
+    _clear_user_override()
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["result_summary"]["dispatch_via"] == "ssh"
+
+
 # ---- (c) timeout khi Agent không bao giờ report ----
 
 
@@ -1543,10 +2073,11 @@ def test_remediate_dry_run_via_agent_times_out_if_never_reported(monkeypatch, _m
     assert timeout_events[0]["payload"]["error"] == "agent_remediate_timeout"
 
 
-# ---- (d) four-eyes / draft-control / dry-run-max-age vẫn đúng cho Agent ----
+# ---- (d) draft-control / dry-run-max-age vẫn đúng cho Agent (four-eyes đã
+# bị bỏ hoàn toàn theo yêu cầu người dùng, kể cả Tier cao) ----
 
 
-def test_remediate_apply_via_agent_still_enforces_four_eyes_on_high_tier(monkeypatch):
+def test_remediate_apply_via_agent_allows_same_user_on_high_tier_after_four_eyes_removed(monkeypatch):
     _register_agent_ready_host(monkeypatch, tier=0)
     _register_control()
     _register_remediation_variant(os_family="Ubuntu", os_version="22.04")
@@ -1558,12 +2089,20 @@ def test_remediate_apply_via_agent_still_enforces_four_eyes_on_high_tier(monkeyp
         "/hosts/agent-target.internal/controls/ctrl-1/remediate/dry-run"
     ).json()["id"]
 
+    _make_agent_report_on_sleep(
+        monkeypatch, "agent-target.internal", "remediate-apply",
+        backup_tar_b64="ZmFrZS1iYWNrdXAtdGFyLWNvbnRlbnQ=",
+    )
     resp = client.post(
         "/hosts/agent-target.internal/controls/ctrl-1/remediate/apply",
         json={"dry_run_job_id": dry_run_id},
     )
     _clear_user_override()
-    assert resp.status_code == 403
+
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["status"] == "succeeded"
+    assert body["result_summary"]["dispatch_via"] == "agent"
 
 
 def test_remediate_apply_via_agent_still_blocks_draft_control(monkeypatch):
@@ -1650,3 +2189,630 @@ def test_remediate_dry_run_conflict_409_when_job_already_pending_agent_path(monk
     resp = client.post("/hosts/agent-target.internal/controls/ctrl-1/remediate/dry-run")
     _clear_user_override()
     assert resp.status_code == 409
+
+
+# ---- POST /hosts/{hostname}/ssh-port-change (app/jobs.py:run_ssh_port_change)
+# — hạng mục rủi ro cao nhất, xem docs/architecture-proposal.md mục 8 ----
+
+_PORT_CHANGE_LOGS_CUTOVER = (
+    "BACKUP_TAR_B64_BEGIN\nZmFrZS1zc2gtYmFja3Vw\nBACKUP_TAR_B64_END\n"
+    "PORT_CHANGE_STATUS=cutover_complete\n"
+)
+_PORT_CHANGE_LOGS_VERIFY_FAILED = (
+    "BACKUP_TAR_B64_BEGIN\nZmFrZS1zc2gtYmFja3Vw\nBACKUP_TAR_B64_END\n"
+    "PORT_CHANGE_STATUS=verify_failed\n"
+)
+
+
+def test_viewer_cannot_trigger_ssh_port_change():
+    _register_host(ca_migration_status="trust_deployed")
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.post("/hosts/scan-target.internal/ssh-port-change", json={"new_port": 2222})
+    _clear_user_override()
+    assert resp.status_code == 403
+
+
+def test_ssh_port_change_unknown_host_404():
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/does-not-exist/ssh-port-change", json={"new_port": 2222})
+    _clear_user_override()
+    assert resp.status_code == 404
+
+
+def test_ssh_port_change_blocked_when_decommissioned():
+    _register_host(ca_migration_status="trust_deployed", decommissioned=True)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/ssh-port-change", json={"new_port": 2222})
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_ssh_port_change_blocked_when_ca_migration_not_started():
+    # Chưa deploy CA trust -> chưa mint được cert ephemeral để tự thực hiện
+    # đổi cổng an toàn (cùng lý do trigger_ssh_check/agent-install chặn).
+    _register_host(ca_migration_status="not_started")
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/ssh-port-change", json={"new_port": 2222})
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_ssh_port_change_rejects_same_port():
+    _register_host(ca_migration_status="trust_deployed")
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/ssh-port-change", json={"new_port": 22})
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_ssh_port_change_success_updates_host_ssh_port(monkeypatch):
+    _register_host(ca_migration_status="trust_deployed")
+    captured = _mock_dispatcher_capturing(monkeypatch, logs=_PORT_CHANGE_LOGS_CUTOVER)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/ssh-port-change", json={"new_port": 2222})
+    _clear_user_override()
+
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["status"] == "succeeded"
+    assert body["job_type"] == "ssh-port-change"
+    assert captured["json"]["environment"]["CURRENT_PORT"] == "22"
+    assert captured["json"]["environment"]["NEW_PORT"] == "2222"
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "scan-target.internal")
+    db.close()
+    assert host.ssh_port == 2222
+
+
+def test_ssh_port_change_verify_failed_does_not_update_host_ssh_port(monkeypatch):
+    # Script tự báo "verify_failed" (cổng mới KHÔNG kết nối được, host vẫn
+    # nghe cả 2 cổng) — job phải "failed" và Host.ssh_port GIỮ NGUYÊN 22,
+    # never dựa exit_code (job-dispatcher vẫn có thể trả exit_code=0 hay
+    # khác tuỳ shell, orchestrator CHỈ tin dòng PORT_CHANGE_STATUS).
+    _register_host(ca_migration_status="trust_deployed")
+    _mock_dispatcher_capturing(monkeypatch, logs=_PORT_CHANGE_LOGS_VERIFY_FAILED, exit_code=1)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/ssh-port-change", json={"new_port": 2222})
+    _clear_user_override()
+
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["status"] == "failed"
+
+    db = _TestSessionLocal()
+    host = db.get(Host, "scan-target.internal")
+    db.close()
+    assert host.ssh_port == 22
+
+
+def test_ssh_port_change_conflict_409_when_remediate_job_running():
+    _register_host(ca_migration_status="trust_deployed")
+    db = _TestSessionLocal()
+    db.add(Job(hostname="scan-target.internal", job_type="remediate-apply", status="running", triggered_by="opuser"))
+    db.commit()
+    db.close()
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/ssh-port-change", json={"new_port": 2222})
+    _clear_user_override()
+    assert resp.status_code == 409
+
+
+def test_remediate_dry_run_conflict_409_when_ssh_port_change_job_running():
+    # Chiều NGƯỢC LẠI của test trên — remediate không được chạy trong lúc
+    # đang có 1 job đổi cổng SSH dở dang trên CÙNG host (cùng 1
+    # _lock_host_for_remediate dùng chung cho cả 2 loại job).
+    _register_host()
+    _register_control()
+    _register_remediation_variant()
+    db = _TestSessionLocal()
+    db.add(Job(hostname="scan-target.internal", job_type="ssh-port-change", status="running", triggered_by="opuser"))
+    db.commit()
+    db.close()
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/controls/ctrl-1/remediate/dry-run")
+    _clear_user_override()
+    assert resp.status_code == 409
+
+
+def test_reconcile_orphaned_remediate_jobs_covers_agent_install(monkeypatch):
+    # Trước đây "agent-install" (app/agents.py:trigger_agent_install) KHÔNG
+    # có trong danh sách job_type của reconcile_orphaned_remediate_jobs, dù
+    # đặt status="running" rồi gọi job-dispatcher ĐỒNG BỘ trong cùng request
+    # y hệt remediate-dry-run/remediate-apply/ssh-port-change — 1 job
+    # agent-install mồ côi (Orchestrator restart giữa lúc dispatch) sẽ kẹt
+    # vĩnh viễn ở "running" mà không có gì tự dọn lúc khởi động lại.
+    monkeypatch.setattr(jobs_module, "SessionLocal", _TestSessionLocal)
+    _register_host()
+    db = _TestSessionLocal()
+    orphaned = Job(hostname="scan-target.internal", job_type="agent-install", status="running", triggered_by="opuser")
+    still_pending_other_host = Job(
+        hostname="scan-target.internal", job_type="agent-install", status="succeeded", triggered_by="opuser"
+    )
+    db.add_all([orphaned, still_pending_other_host])
+    db.commit()
+    orphaned_id = orphaned.id
+    succeeded_id = still_pending_other_host.id
+    db.close()
+
+    count = jobs_module.reconcile_orphaned_remediate_jobs()
+    assert count == 1
+
+    db = _TestSessionLocal()
+    reconciled = db.get(Job, orphaned_id)
+    untouched = db.get(Job, succeeded_id)
+    db.close()
+    assert reconciled.status == "failed"
+    assert reconciled.result_summary == {"error": "orchestrator_restarted"}
+    assert reconciled.finished_at is not None
+    assert untouched.status == "succeeded"
+
+
+def test_reconcile_orphaned_remediate_jobs_covers_ssh_check(monkeypatch):
+    # ssh-check giờ cũng chạy phần chờ job-dispatcher qua BackgroundTasks
+    # (mục "progress bar % thật") — cùng rủi ro mồ côi y hệt agent-install
+    # nếu Orchestrator restart giữa lúc BackgroundTasks đang chạy.
+    monkeypatch.setattr(jobs_module, "SessionLocal", _TestSessionLocal)
+    _register_host()
+    db = _TestSessionLocal()
+    orphaned = Job(hostname="scan-target.internal", job_type="ssh-check", status="running", triggered_by="opuser")
+    db.add(orphaned)
+    db.commit()
+    orphaned_id = orphaned.id
+    db.close()
+
+    count = jobs_module.reconcile_orphaned_remediate_jobs()
+    assert count == 1
+
+    db = _TestSessionLocal()
+    reconciled = db.get(Job, orphaned_id)
+    db.close()
+    assert reconciled.status == "failed"
+    assert reconciled.result_summary == {"error": "orchestrator_restarted"}
+
+
+# ---- GET /jobs/{id}/progress — % tiến độ thật cho ssh-check/agent-install
+# (đọc log live của container qua job-dispatcher), 0/"unknown" cho job_type
+# khác hoặc khi job-dispatcher không tới được (best-effort, không raise) ----
+
+
+def test_job_progress_terminal_job_returns_100(monkeypatch):
+    _register_host()
+    db = _TestSessionLocal()
+    job = Job(hostname="scan-target.internal", job_type="ssh-check", status="succeeded", triggered_by="opuser")
+    db.add(job)
+    db.commit()
+    job_id = job.id
+    db.close()
+
+    def _should_not_be_called(*args, **kwargs):
+        raise AssertionError("không được gọi job-dispatcher cho job đã terminal")
+
+    monkeypatch.setattr(httpx, "get", _should_not_be_called)
+    app.dependency_overrides[get_current_user] = _as("vieweruser", "viewer")
+    resp = client.get(f"/jobs/{job_id}/progress")
+    _clear_user_override()
+    assert resp.status_code == 200
+    assert resp.json() == {"job_id": job_id, "status": "succeeded", "pct": 100, "stage": "succeeded"}
+
+
+def test_job_progress_running_unsupported_job_type_returns_unknown(monkeypatch):
+    _register_host()
+    db = _TestSessionLocal()
+    job = Job(hostname="scan-target.internal", job_type="scan", status="running", triggered_by="opuser")
+    db.add(job)
+    db.commit()
+    job_id = job.id
+    db.close()
+
+    def _should_not_be_called(*args, **kwargs):
+        raise AssertionError("không được gọi job-dispatcher cho job_type ngoài phạm vi")
+
+    monkeypatch.setattr(httpx, "get", _should_not_be_called)
+    app.dependency_overrides[get_current_user] = _as("vieweruser", "viewer")
+    resp = client.get(f"/jobs/{job_id}/progress")
+    _clear_user_override()
+    assert resp.status_code == 200
+    assert resp.json() == {"job_id": job_id, "status": "running", "pct": 0, "stage": "unknown"}
+
+
+def test_job_progress_running_supported_type_passes_through_job_dispatcher_result(monkeypatch):
+    _register_host()
+    db = _TestSessionLocal()
+    job = Job(hostname="scan-target.internal", job_type="agent-install", status="running", triggered_by="opuser")
+    db.add(job)
+    db.commit()
+    job_id = job.id
+    db.close()
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"pct": 35, "stage": "mkdir_remote"}
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: _FakeResponse())
+    app.dependency_overrides[get_current_user] = _as("vieweruser", "viewer")
+    resp = client.get(f"/jobs/{job_id}/progress")
+    _clear_user_override()
+    assert resp.status_code == 200
+    assert resp.json() == {"job_id": job_id, "status": "running", "pct": 35, "stage": "mkdir_remote"}
+
+
+def test_job_progress_job_dispatcher_error_returns_unknown_not_502(monkeypatch):
+    # Endpoint này KHÔNG BAO GIỜ được lộ lỗi ra người dùng — chỉ là gợi ý UI
+    # polled liên tục, container chưa kịp tạo (job-dispatcher 404) hay lỗi
+    # tạm thời đều coi như "chưa biết", không phải lỗi hệ thống.
+    _register_host()
+    db = _TestSessionLocal()
+    job = Job(hostname="scan-target.internal", job_type="ssh-check", status="running", triggered_by="opuser")
+    db.add(job)
+    db.commit()
+    job_id = job.id
+    db.close()
+
+    def _raise(*args, **kwargs):
+        raise httpx.ConnectError("job-dispatcher không tới được")
+
+    monkeypatch.setattr(httpx, "get", _raise)
+    app.dependency_overrides[get_current_user] = _as("vieweruser", "viewer")
+    resp = client.get(f"/jobs/{job_id}/progress")
+    _clear_user_override()
+    assert resp.status_code == 200
+    assert resp.json() == {"job_id": job_id, "status": "running", "pct": 0, "stage": "unknown"}
+
+
+def test_job_progress_unknown_job_404():
+    app.dependency_overrides[get_current_user] = _as("vieweruser", "viewer")
+    resp = client.get("/jobs/999999/progress")
+    _clear_user_override()
+    assert resp.status_code == 404
+
+
+# ---- Static SSH key (lựa chọn thay thế cho cert CA ngắn hạn, theo yêu cầu
+# người dùng đã xác nhận đánh đổi bảo mật) — _get_ssh_dispatch_environment,
+# _decrypt_transport_payload, POST /hosts/{hostname}/bootstrap-static-ssh-key.
+# ĐẶT TRONG file này (không phải file riêng) — cả 2 hàm cùng route đều sống
+# trong app/jobs.py và dùng jobs_module._get_db, tách file riêng sẽ ĐÈ LÊN
+# override app.dependency_overrides[jobs_module._get_db] của chính file này
+# (phát hiện qua chạy test thật: toàn bộ test_jobs.py gãy vì bị route sang
+# engine SQLite rỗng của file khác — 2 file KHÔNG thể cùng override 1 key). ----
+
+_TRANSPORT_ITER = 200_000
+
+
+def _openssl_style_encrypt(plaintext: bytes, passphrase: str) -> bytes:
+    """Ngược lại _decrypt_transport_payload — dùng lại TRONG TEST để mô
+    phỏng chính xác thứ static-ssh-key-bootstrap.sh sẽ in ra (`openssl enc
+    -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:...`), KHÔNG gọi
+    lại _decrypt_transport_payload — encrypt/decrypt độc lập để test thật sự
+    xác nhận 2 chiều khớp nhau, không phải tự mã rồi tự giải bằng CÙNG 1 hàm."""
+    salt = os.urandom(8)
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=48, salt=salt, iterations=_TRANSPORT_ITER)
+    key_iv = kdf.derive(passphrase.encode())
+    key, iv = key_iv[:32], key_iv[32:]
+    padder = sym_padding.PKCS7(128).padder()
+    padded = padder.update(plaintext) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+    return b"Salted__" + salt + ciphertext
+
+
+def test_decrypt_transport_payload_roundtrip():
+    ciphertext = _openssl_style_encrypt(b"-----BEGIN FAKE KEY-----", "my-passphrase")
+    b64 = base64.b64encode(ciphertext).decode()
+    assert jobs_module._decrypt_transport_payload(b64, "my-passphrase") == b"-----BEGIN FAKE KEY-----"
+
+
+def test_decrypt_transport_payload_wrong_passphrase_raises():
+    ciphertext = _openssl_style_encrypt(b"secret-key-material", "correct-passphrase")
+    b64 = base64.b64encode(ciphertext).decode()
+    with pytest.raises(ValueError):
+        jobs_module._decrypt_transport_payload(b64, "wrong-passphrase")
+
+
+def test_decrypt_transport_payload_missing_salted_header_raises():
+    b64 = base64.b64encode(b"not-the-right-format-at-all").decode()
+    with pytest.raises(ValueError, match="Salted__"):
+        jobs_module._decrypt_transport_payload(b64, "any-passphrase")
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="cần binary openssl để verify interop thật")
+def test_decrypt_transport_payload_matches_real_openssl_output():
+    # Verify THẬT với binary openssl (không chỉ mô phỏng bằng cryptography ở
+    # trên) — xác nhận _decrypt_transport_payload khớp ĐÚNG cách
+    # static-ssh-key-bootstrap.sh sẽ in ra trên lab thật.
+    plaintext = b"real-openssl-interop-check"
+    with tempfile.NamedTemporaryFile() as inp, tempfile.NamedTemporaryFile() as out:
+        inp.write(plaintext)
+        inp.flush()
+        subprocess.run(
+            [
+                "openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", str(_TRANSPORT_ITER), "-md", "sha256",
+                "-pass", "env:TEST_PASSPHRASE", "-in", inp.name, "-out", out.name,
+            ],
+            env={**os.environ, "TEST_PASSPHRASE": "interop-passphrase"},
+            check=True,
+        )
+        ciphertext = out.read()
+    b64 = base64.b64encode(ciphertext).decode()
+    assert jobs_module._decrypt_transport_payload(b64, "interop-passphrase") == plaintext
+
+
+def test_get_ssh_dispatch_environment_mints_ca_cert_by_default(monkeypatch):
+    monkeypatch.setattr(jobs_module, "mint_ssh_certificate", lambda principal: ("FAKE-KEY", f"FAKE-CERT-{principal}"))
+    host = Host(hostname="h", ip_address="1.2.3.4", ssh_user="deploy")
+    env = jobs_module._get_ssh_dispatch_environment(host, principal="deploy")
+    assert base64.b64decode(env["SSH_KEY_B64"]).decode() == "FAKE-KEY"
+    assert base64.b64decode(env["SSH_CERT_B64"]).decode() == "FAKE-CERT-deploy"
+
+
+def test_get_ssh_dispatch_environment_uses_static_key_when_configured(monkeypatch):
+    def _fail_if_called(principal):
+        raise AssertionError("không được mint cert CA khi host đã có static SSH key")
+
+    monkeypatch.setattr(jobs_module, "mint_ssh_certificate", _fail_if_called)
+    host = Host(
+        hostname="h", ip_address="1.2.3.4", ssh_user="root",
+        static_ssh_private_key_encrypted=encrypt_host_secret("STATIC-PRIVATE-KEY"),
+    )
+    env = jobs_module._get_ssh_dispatch_environment(host, principal="root")
+    assert base64.b64decode(env["SSH_KEY_B64"]).decode() == "STATIC-PRIVATE-KEY"
+    assert "SSH_CERT_B64" not in env
+
+
+def test_get_ssh_dispatch_environment_propagates_mint_failure(monkeypatch):
+    def _raise(principal):
+        raise RuntimeError("step-ca từ chối cấp")
+
+    monkeypatch.setattr(jobs_module, "mint_ssh_certificate", _raise)
+    host = Host(hostname="h", ip_address="1.2.3.4", ssh_user="root")
+    with pytest.raises(RuntimeError):
+        jobs_module._get_ssh_dispatch_environment(host, principal="root")
+
+
+def _success_logs(passphrase: str, private_key_pem: str = "FAKE-STATIC-PRIVATE-KEY-PEM") -> str:
+    ciphertext = _openssl_style_encrypt(private_key_pem.encode(), passphrase)
+    enc_b64 = base64.b64encode(ciphertext).decode()
+    return (
+        "STATIC_SSH_PUBLIC_KEY=ssh-ed25519 AAAAFAKE hardening-console-managed\n"
+        f"STATIC_SSH_PRIVATE_KEY_ENC_B64={enc_b64}\n"
+        "STATIC_KEY_BOOTSTRAP_STATUS=ok\n"
+    )
+
+
+def _mock_static_key_dispatcher_capturing(monkeypatch, exit_code=0, capture=None, logs_fn=_success_logs):
+    def _fake_post(url, json=None, **kwargs):
+        if capture is not None:
+            capture.append(json)
+        passphrase = json["environment"]["TRANSPORT_PASSPHRASE"]
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"job_id": json["job_id"], "exit_code": exit_code, "logs": logs_fn(passphrase)}
+
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+
+def test_viewer_cannot_bootstrap_static_ssh_key():
+    _register_host()
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-static-ssh-key",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": "pw"},
+    )
+    _clear_user_override()
+    assert resp.status_code == 403
+
+
+def test_bootstrap_static_ssh_key_unknown_host_404():
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/does-not-exist/bootstrap-static-ssh-key",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": "pw"},
+    )
+    _clear_user_override()
+    assert resp.status_code == 404
+
+
+def test_bootstrap_static_ssh_key_requires_not_started():
+    _register_host(ca_migration_status="trust_deployed")
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-static-ssh-key",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": "pw"},
+    )
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_bootstrap_static_ssh_key_requires_exactly_one_credential():
+    _register_host()
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-static-ssh-key",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": "pw", "legacy_ssh_private_key": "key-data"},
+    )
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_bootstrap_static_ssh_key_rejects_decommissioned_host():
+    _register_host(decommissioned=True)
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-static-ssh-key",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": "pw"},
+    )
+    _clear_user_override()
+    assert resp.status_code == 422
+
+
+def test_bootstrap_static_ssh_key_success_stores_encrypted_key(monkeypatch, _mock_cert):
+    _register_host(ssh_user="root")
+    captured = []
+    _mock_static_key_dispatcher_capturing(monkeypatch, exit_code=0, capture=captured)
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-static-ssh-key",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": "old-pw"},
+    )
+    _clear_user_override()
+    assert resp.status_code == 202
+    job = resp.json()
+    assert job["status"] == "succeeded"
+
+    host = _get_host()
+    assert host.ca_migration_status == "trust_deployed"
+    assert host.ca_migration_updated_by == "opuser"
+    assert host.static_ssh_private_key_encrypted is not None
+
+    # Private key KHÔNG BAO GIỜ xuất hiện trong result_summary (kể cả dạng mã
+    # hoá) — job type này cố tình không lưu raw_log_tail, khác mọi job khác.
+    summary = job["result_summary"]
+    assert "raw_log_tail" not in summary
+    assert "FAKE-STATIC-PRIVATE-KEY-PEM" not in str(summary)
+    assert summary["public_key_installed"].startswith("ssh-ed25519")
+
+    # Audit event CHỈ log status, không lộ key qua đây (khác trigger_scan lỡ
+    # nhúng nguyên summary vào audit payload).
+    completed_event = next(c for c in _mock_cert if c["action"] == "static_ssh_key_bootstrap_completed")
+    assert completed_event["payload"] == {"job_id": job["id"], "status": "succeeded"}
+    assert "FAKE-STATIC-PRIVATE-KEY-PEM" not in str(completed_event)
+    assert "old-pw" not in str(job)
+
+
+def test_bootstrap_static_ssh_key_installs_into_both_root_and_ssh_user(monkeypatch):
+    _register_host(ssh_user="deploy")
+    captured = []
+    _mock_static_key_dispatcher_capturing(monkeypatch, exit_code=0, capture=captured)
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-static-ssh-key",
+        json={"legacy_ssh_user": "deploy", "legacy_ssh_password": "pw"},
+    )
+    _clear_user_override()
+    assert resp.status_code == 202
+    assert captured[0]["environment"]["STATIC_KEY_TARGET_USERS"] == "deploy,root"
+
+
+def test_bootstrap_static_ssh_key_dedupes_target_users_when_ssh_user_is_root(monkeypatch):
+    _register_host(ssh_user="root")
+    captured = []
+    _mock_static_key_dispatcher_capturing(monkeypatch, exit_code=0, capture=captured)
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-static-ssh-key",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": "pw"},
+    )
+    _clear_user_override()
+    assert resp.status_code == 202
+    assert captured[0]["environment"]["STATIC_KEY_TARGET_USERS"] == "root"
+
+
+def test_bootstrap_static_ssh_key_script_failure_does_not_update_host(monkeypatch):
+    _register_host()
+    _mock_static_key_dispatcher_capturing(monkeypatch, exit_code=1, logs_fn=lambda p: "STATIC_KEY_BOOTSTRAP_STATUS=failed\n")
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-static-ssh-key",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": "pw"},
+    )
+    _clear_user_override()
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "failed"
+
+    host = _get_host()
+    assert host.ca_migration_status == "not_started"
+    assert host.static_ssh_private_key_encrypted is None
+
+
+def test_bootstrap_static_ssh_key_exit_0_but_missing_key_line_is_still_failed(monkeypatch):
+    # exit_code=0 KHÔNG đủ — thiếu dòng STATIC_SSH_PRIVATE_KEY_ENC_B64= (vd
+    # log bị cắt cụt giữa đường) PHẢI coi là thất bại, không set trust_deployed
+    # mà không có key thật để dùng.
+    _register_host()
+    _mock_static_key_dispatcher_capturing(monkeypatch, exit_code=0, logs_fn=lambda p: "STATIC_KEY_BOOTSTRAP_STATUS=ok\n")
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-static-ssh-key",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": "pw"},
+    )
+    _clear_user_override()
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "failed"
+
+    host = _get_host()
+    assert host.ca_migration_status == "not_started"
+    assert host.static_ssh_private_key_encrypted is None
+
+
+def test_bootstrap_static_ssh_key_dispatcher_error_returns_502(monkeypatch, _mock_cert):
+    _register_host()
+
+    def _raise(*a, **kw):
+        raise httpx.ConnectError("job-dispatcher không phản hồi")
+
+    monkeypatch.setattr(httpx, "post", _raise)
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post(
+        "/hosts/scan-target.internal/bootstrap-static-ssh-key",
+        json={"legacy_ssh_user": "root", "legacy_ssh_password": "pw"},
+    )
+    _clear_user_override()
+    assert resp.status_code == 502
+    assert _mock_cert[-1]["action"] == "static_ssh_key_bootstrap_failed"
+
+    host = _get_host()
+    assert host.ca_migration_status == "not_started"
+
+
+def test_trigger_scan_uses_static_key_when_configured(monkeypatch):
+    _register_host(
+        ssh_user="root", ca_migration_status="migrated",
+        static_ssh_private_key_encrypted=encrypt_host_secret("STATIC-PRIVATE-KEY"),
+    )
+
+    def _fail_if_called(principal):
+        raise AssertionError("không được mint cert CA khi host đã có static SSH key")
+
+    monkeypatch.setattr(jobs_module, "mint_ssh_certificate", _fail_if_called)
+
+    captured = []
+
+    def _fake_post(url, json=None, **kwargs):
+        captured.append(json)
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"job_id": json["job_id"], "exit_code": 0, "logs": "SCAN_JOB_STATUS=completed\n"}
+
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    app.dependency_overrides[get_current_user] = _as("opuser", "operator")
+    resp = client.post("/hosts/scan-target.internal/scan", json={"scap_profile_key": "ubuntu2204-standard"})
+    _clear_user_override()
+    assert resp.status_code == 202
+
+    env = captured[0]["environment"]
+    assert "SSH_CERT_B64" not in env
+    assert base64.b64decode(env["SSH_KEY_B64"]).decode() == "STATIC-PRIVATE-KEY"

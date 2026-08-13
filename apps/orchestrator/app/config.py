@@ -27,6 +27,15 @@ class Settings(BaseSettings):
     # "orchestrator" (confidential, dùng cho service/test qua password grant)
     # và "web" (public, Authorization Code + PKCE cho SPA — xem apps/web/).
     keycloak_client_ids: str = "orchestrator,web"
+    # Secret của client "orchestrator-admin" (confidential, service account,
+    # xem infra/keycloak/realm-export.json + bootstrap-admin-client.sh) —
+    # Orchestrator dùng client_credentials grant với secret này để tự lấy
+    # access token gọi Keycloak Admin REST API (app/keycloak_admin.py, tính
+    # năng Quản lý người dùng ở app/users.py). KHÁC keycloak_tls_shared_secret
+    # (đó là secret RIÊNG của Orchestrator dùng để XÁC THỰC CHÍNH NÓ khi các
+    # service khác xin cert TLS — không liên quan gì tới việc gọi Keycloak
+    # Admin API).
+    keycloak_admin_client_secret: str
     secret_key: str
     # Origin của Web UI, dùng để cấu hình CORS cho phép trình duyệt gọi API
     # (SPA và API khác port/origin nên cần CORS, không có middleware này thì
@@ -116,6 +125,10 @@ class Settings(BaseSettings):
     # qua audit log thiếu "agent_enrolled" dù "agent_install_completed" đã có
     # (không phải suy đoán — xem app/agents.py:_build_agent_env_file).
     agent_manager_public_url: str = ""
+    # Thư mục mount read-only chứa file playbook Ansible chính thức
+    # (ComplianceAsCode, mỗi file 1 product+profile) dùng cho tab "Template"
+    # trong Control Registry — xem app/control_templates.py + control-templates/README.md.
+    control_templates_dir: str = "/control-templates"
     # Allowlist principal SSH cho scan/ssh-check (mục "sửa host"), phân cách
     # dấu phẩy — quyết định ở CẤP TRIỂN KHAI (.env), không phải operator tự
     # chọn tuỳ ý qua UI: provisioner "orchestrator" trên step-ca không tự
@@ -132,6 +145,22 @@ class Settings(BaseSettings):
     # ứng dụng tự giải mã được thì kẻ tấn công qua ứng dụng cũng vậy; chỉ
     # chặn được kịch bản lộ riêng bản backup DB mà không lộ kèm .env/server.
     host_credential_encryption_key: str = ""
+
+    # --- Dựng TLS thật cho Keycloak/Web/chính Orchestrator (mục "còn cần
+    # chú ý" — sslRequired="none" trước đây chỉ chấp nhận được vì CHƯA có TLS
+    # ở đâu cả) ---
+    # Shared secret riêng cho từng service gọi 2 endpoint mint cert mới
+    # (app/jobs.py) — KHÔNG dùng chung agent_manager_shared_secret/
+    # job_dispatcher_shared_secret (đúng nguyên tắc "mỗi service 1 secret
+    # riêng" đã áp dụng xuyên suốt, tránh 1 secret lộ ảnh hưởng nhiều service).
+    keycloak_tls_shared_secret: str
+    web_tls_shared_secret: str
+    # IP/hostname LAN mà TRÌNH DUYỆT dùng để truy cập (vd "172.30.2.111") —
+    # PHẢI nằm trong SAN của cert Keycloak/Web/Orchestrator, nếu không trình
+    # duyệt sẽ báo lỗi "cert không khớp tên miền" dù chain hợp lệ. Tách khỏi
+    # agent_manager_public_url (dùng SAME giá trị thật nhưng mục đích khác —
+    # đó là URL Agent THẬT trên fleet gọi tới, đây là SAN cho browser/SPA).
+    public_host: str
 
     class Config:
         env_file = ".env"
@@ -170,6 +199,10 @@ class Settings(BaseSettings):
             "agent_manager_shared_secret": self.agent_manager_shared_secret,
             "content_signing_trusted_fingerprint": self.content_signing_trusted_fingerprint,
             "host_credential_encryption_key": self.host_credential_encryption_key,
+            "keycloak_tls_shared_secret": self.keycloak_tls_shared_secret,
+            "web_tls_shared_secret": self.web_tls_shared_secret,
+            "public_host": self.public_host,
+            "keycloak_admin_client_secret": self.keycloak_admin_client_secret,
         }
         empty = [name for name, value in required_nonempty.items() if not value]
         if empty:

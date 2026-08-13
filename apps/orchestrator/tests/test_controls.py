@@ -1,7 +1,7 @@
 """Integration test cho Control Registry API — dùng SQLite in-memory (không
 cần Postgres thật) + override get_current_user để giả lập từng vai trò,
-verify đúng RBAC (kể cả ràng buộc four-eyes) chạy qua HTTP thật (TestClient),
-không chỉ test hàm Python trần."""
+verify đúng RBAC chạy qua HTTP thật (TestClient), không chỉ test hàm
+Python trần."""
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -89,21 +89,15 @@ def test_rule_editor_can_create_and_viewer_can_read():
     assert len(resp.json()) == 1
 
 
-def test_four_eyes_blocks_self_approval(_mock_audit):
+def test_self_approval_allowed_after_four_eyes_removed(_mock_audit):
+    """Four-eyes (người duyệt != người tạo) đã bị bỏ theo yêu cầu người dùng
+    — carol vừa tạo control vừa tự duyệt maturity phải thành công."""
     app.dependency_overrides[get_current_user] = _as("carol", "rule-editor")
     created = client.post("/controls", json={"title": "Enforce password complexity", "category": "auth"})
     control_id = created.json()["id"]
     assert len(_mock_audit) == 1  # create_control tự ghi audit
 
-    # Chính người tạo (carol) có role approver luôn -> vẫn phải bị chặn tự duyệt.
     app.dependency_overrides[get_current_user] = _as("carol", "rule-editor", "approver")
-    resp = client.patch(f"/controls/{control_id}/maturity", json={"maturity": "reviewed"})
-    assert resp.status_code == 403
-    assert "four-eyes" in resp.json()["detail"]
-    assert len(_mock_audit) == 1  # lần bị chặn không ghi thêm audit event
-
-    # Người khác (dave) có role approver -> được phép.
-    app.dependency_overrides[get_current_user] = _as("dave", "approver")
     resp = client.patch(f"/controls/{control_id}/maturity", json={"maturity": "reviewed"})
     _clear_user_override()
     assert resp.status_code == 200
@@ -368,23 +362,15 @@ def test_duplicate_standard_mapping_does_not_leave_orphan_history_row():
 # ---- PATCH /controls/{control_id}/risk-group (app/controls.py) ----
 
 
-def test_risk_group_four_eyes_blocks_self_approval(_mock_audit):
+def test_risk_group_self_approval_allowed_after_four_eyes_removed(_mock_audit):
+    """Four-eyes đã bị bỏ theo yêu cầu người dùng — carol (có role approver)
+    tự gán risk_group cho control mình tạo phải thành công, giống hệt
+    update_control_maturity."""
     app.dependency_overrides[get_current_user] = _as("carol", "rule-editor", "approver")
     control_id = client.post(
         "/controls", json={"title": "Risk group self approve", "category": "auth"}
     ).json()["id"]
 
-    # Chính carol (dù có role approver) tự gán risk_group cho control mình
-    # tạo -> phải bị chặn (four-eyes), giống hệt update_control_maturity.
-    # Dùng risk_group="B" (không phải "A") để cô lập đúng four-eyes, không
-    # trộn với ràng buộc "risk_group A cần maturity production" (control ở
-    # đây vẫn còn "draft").
-    resp = client.patch(f"/controls/{control_id}/risk-group", json={"risk_group": "B"})
-    assert resp.status_code == 403
-    assert "four-eyes" in resp.json()["detail"]
-
-    # Người khác (dave) -> được phép.
-    app.dependency_overrides[get_current_user] = _as("dave", "approver")
     resp = client.patch(f"/controls/{control_id}/risk-group", json={"risk_group": "B"})
     _clear_user_override()
     assert resp.status_code == 200
@@ -449,3 +435,164 @@ def test_add_standard_mapping_and_remediation_variant():
     _clear_user_override()
     assert len(detail["standard_mappings"]) == 1
     assert len(detail["remediation_variants"]) == 1
+
+
+# ---- GET /controls/lookup (cầu nối rule_id lúc quét <-> Control dùng để sửa,
+# xem app/models.py:StandardMapping.cis_rule_id) ----
+
+
+def _create_control_with_rule_mapping_and_variant(
+    rule_id="sshd_disable_root_login", os_family="Ubuntu", os_version="22.04", title="Disable SSH root login"
+):
+    app.dependency_overrides[get_current_user] = _as("bob", "rule-editor")
+    control_id = client.post("/controls", json={"title": title, "category": "ssh"}).json()["id"]
+    client.post(
+        f"/controls/{control_id}/standard-mappings",
+        json={
+            "standard": "CIS-RULE-ID",
+            "standard_version": "ubuntu2204-cis_level1_server",
+            "section_id": rule_id,
+            "cis_rule_id": rule_id,
+        },
+    )
+    client.post(
+        f"/controls/{control_id}/remediation-variants",
+        json={
+            "os_family": os_family,
+            "os_version": os_version,
+            "check_method": "ansible-check",
+            "remediation_ref": "ssh-cis-official-v1",
+        },
+    )
+    _clear_user_override()
+    return control_id
+
+
+def _promote_to_production(control_id: str):
+    app.dependency_overrides[get_current_user] = _as("promoter", "approver")
+    client.patch(f"/controls/{control_id}/maturity", json={"maturity": "reviewed"})
+    client.patch(f"/controls/{control_id}/maturity", json={"maturity": "production"})
+    _clear_user_override()
+
+
+def test_lookup_fixable_true_when_production_and_variant_match():
+    control_id = _create_control_with_rule_mapping_and_variant()
+    _promote_to_production(control_id)
+
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.get(
+        "/controls/lookup",
+        params={
+            "rule_ids": "xccdf_org.ssgproject.content_rule_sshd_disable_root_login",
+            "os_family": "Ubuntu",
+            "os_version": "22.04",
+        },
+    )
+    _clear_user_override()
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == [
+        {
+            "rule_id": "xccdf_org.ssgproject.content_rule_sshd_disable_root_login",
+            "fixable": True,
+            "control_id": control_id,
+            "control_title": "Disable SSH root login",
+        }
+    ]
+
+
+def test_lookup_accepts_bare_rule_id_without_xccdf_prefix():
+    control_id = _create_control_with_rule_mapping_and_variant()
+    _promote_to_production(control_id)
+
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.get(
+        "/controls/lookup",
+        params={"rule_ids": "sshd_disable_root_login", "os_family": "Ubuntu", "os_version": "22.04"},
+    )
+    _clear_user_override()
+    assert resp.json()[0]["fixable"] is True
+
+
+def test_lookup_fixable_false_when_os_version_unspecified_and_variant_is_version_specific():
+    # os_version không truyền (host không rõ version, hoặc caller không có)
+    # CHỈ khớp được RemediationVariant khai os_version=NULL (wildcard) —
+    # cùng đúng logic app/jobs.py:_find_remediation_variant dùng lúc
+    # remediate thật, để "fixable" phản ánh đúng remediate-apply có thật sự
+    # chạy được hay không cho host đó, không lạc quan quá mức.
+    control_id = _create_control_with_rule_mapping_and_variant(os_version="22.04")
+    _promote_to_production(control_id)
+
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.get(
+        "/controls/lookup",
+        params={"rule_ids": "xccdf_org.ssgproject.content_rule_sshd_disable_root_login", "os_family": "Ubuntu"},
+    )
+    _clear_user_override()
+    assert resp.json()[0]["fixable"] is False
+
+
+def test_lookup_fixable_false_when_control_still_draft():
+    _create_control_with_rule_mapping_and_variant()  # KHÔNG promote
+
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.get(
+        "/controls/lookup",
+        params={"rule_ids": "xccdf_org.ssgproject.content_rule_sshd_disable_root_login", "os_family": "Ubuntu"},
+    )
+    _clear_user_override()
+    body = resp.json()[0]
+    assert body["fixable"] is False
+    assert body["control_id"] is None
+
+
+def test_lookup_fixable_false_when_no_matching_remediation_variant():
+    # Production nhưng variant chỉ có cho Ubuntu — host Debian không khớp.
+    control_id = _create_control_with_rule_mapping_and_variant(os_family="Ubuntu")
+    _promote_to_production(control_id)
+
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.get(
+        "/controls/lookup",
+        params={"rule_ids": "xccdf_org.ssgproject.content_rule_sshd_disable_root_login", "os_family": "Debian"},
+    )
+    _clear_user_override()
+    assert resp.json()[0]["fixable"] is False
+
+
+def test_lookup_unknown_rule_id_returns_fixable_false():
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.get(
+        "/controls/lookup", params={"rule_ids": "totally-unknown-rule", "os_family": "Ubuntu"}
+    )
+    _clear_user_override()
+    assert resp.json() == [
+        {"rule_id": "totally-unknown-rule", "fixable": False, "control_id": None, "control_title": None}
+    ]
+
+
+def test_lookup_multiple_rule_ids_mixed_fixable():
+    control_id = _create_control_with_rule_mapping_and_variant()
+    _promote_to_production(control_id)
+
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.get(
+        "/controls/lookup",
+        params={
+            "rule_ids": "xccdf_org.ssgproject.content_rule_sshd_disable_root_login,xccdf_org.ssgproject.content_rule_unknown_thing",
+            "os_family": "Ubuntu",
+            "os_version": "22.04",
+        },
+    )
+    _clear_user_override()
+    body = resp.json()
+    assert len(body) == 2
+    assert body[0]["fixable"] is True
+    assert body[1]["fixable"] is False
+
+
+def test_lookup_rejects_empty_rule_ids():
+    app.dependency_overrides[get_current_user] = _as("alice", "viewer")
+    resp = client.get("/controls/lookup", params={"rule_ids": "", "os_family": "Ubuntu"})
+    _clear_user_override()
+    assert resp.status_code == 422

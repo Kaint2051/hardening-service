@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Table from "@mui/material/Table";
 import TableHead from "@mui/material/TableHead";
 import TableBody from "@mui/material/TableBody";
@@ -15,39 +15,37 @@ import DialogTitle from "@mui/material/DialogTitle";
 import DialogContent from "@mui/material/DialogContent";
 import DialogActions from "@mui/material/DialogActions";
 import TextField from "@mui/material/TextField";
-import Snackbar from "@mui/material/Snackbar";
 import Alert from "@mui/material/Alert";
 import CircularProgress from "@mui/material/CircularProgress";
 import Divider from "@mui/material/Divider";
-import { api, ApiError } from "../api/client";
+import Tabs from "@mui/material/Tabs";
+import Tab from "@mui/material/Tab";
+import Checkbox from "@mui/material/Checkbox";
+import Select from "@mui/material/Select";
+import MenuItem from "@mui/material/MenuItem";
+import FormControl from "@mui/material/FormControl";
+import InputLabel from "@mui/material/InputLabel";
+import { api } from "../api/client";
 import { MATURITY_LEVELS } from "../api/types";
 import type {
   CanaryRolloutDetailOut,
   ControlDetailOut,
   ControlOut,
+  ControlTemplateOut,
+  ControlTemplateRuleOut,
   ControlVersionOut,
   Maturity,
 } from "../api/types";
-
-const maturityColor: Record<Maturity, "default" | "warning" | "success"> = {
-  draft: "default",
-  reviewed: "warning",
-  production: "success",
-};
+import PageHeader from "../components/PageHeader";
+import { useSnackbar } from "../hooks/useSnackbar";
+import { errMessage } from "../lib/errors";
+// progressColor thay statusChipColor cũ (logic giống hệt: chip trạng thái
+// canary rollout + job dry-run/apply từng host).
+import { maturityColor, progressColor } from "../lib/statusColors";
 
 function nextMaturity(current: Maturity): Maturity | null {
   const idx = MATURITY_LEVELS.indexOf(current);
   return idx >= 0 && idx < MATURITY_LEVELS.length - 1 ? MATURITY_LEVELS[idx + 1] : null;
-}
-
-// Dùng chung cho status chip của cả canary rollout (running/completed/aborted)
-// lẫn job dry-run/apply từng host (pending/running/succeeded/failed) — 2 tập
-// giá trị không trùng chữ nhưng ý nghĩa "đang chạy/xong tốt/lỗi" giống nhau.
-function statusChipColor(status: string): "default" | "warning" | "success" | "error" | "info" {
-  if (status === "succeeded" || status === "completed") return "success";
-  if (status === "failed" || status === "aborted") return "error";
-  if (status === "running") return "info";
-  return "default";
 }
 
 function describeEvent(v: ControlVersionOut): string {
@@ -69,9 +67,9 @@ function describeEvent(v: ControlVersionOut): string {
 }
 
 export default function ControlsPage() {
+  const { showSuccess, showError } = useSnackbar();
   const [controls, setControls] = useState<ControlOut[]>([]);
   const [loading, setLoading] = useState(true);
-  const [snack, setSnack] = useState<{ severity: "success" | "error"; message: string } | null>(null);
 
   const [createOpen, setCreateOpen] = useState(false);
   const [createForm, setCreateForm] = useState({ title: "", description: "", category: "" });
@@ -92,12 +90,108 @@ export default function ControlsPage() {
   const [canaryStarting, setCanaryStarting] = useState(false);
   const [canaryRollout, setCanaryRollout] = useState<CanaryRolloutDetailOut | null>(null);
 
+  // Tab "Template" — duyệt + chọn rule từ nội dung chuẩn chính thức để tạo
+  // Control mới, xem app/control_templates.py.
+  const [tab, setTab] = useState(0);
+  const [templates, setTemplates] = useState<ControlTemplateOut[]>([]);
+  const [selectedTemplateId, setSelectedTemplateId] = useState("");
+  const [templateRules, setTemplateRules] = useState<ControlTemplateRuleOut[]>([]);
+  const [rulesLoading, setRulesLoading] = useState(false);
+  const [ruleFilter, setRuleFilter] = useState("");
+  const [selectedRuleIds, setSelectedRuleIds] = useState<Set<string>>(new Set());
+  const [previewPlaybook, setPreviewPlaybook] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [templateCreateForm, setTemplateCreateForm] = useState({ title: "", category: "", description: "" });
+  const [creatingFromTemplate, setCreatingFromTemplate] = useState(false);
+  const [templateCreateResult, setTemplateCreateResult] = useState<{
+    control_id: string;
+    standard_mappings_added: number;
+  } | null>(null);
+
+  useEffect(() => {
+    if (tab !== 1 || templates.length > 0) return;
+    api
+      .listControlTemplates()
+      .then(setTemplates)
+      .catch((err) => showError(errMessage(err)));
+  }, [tab, templates.length]);
+
+  useEffect(() => {
+    setSelectedRuleIds(new Set());
+    setPreviewPlaybook(null);
+    setTemplateCreateResult(null);
+    setRuleFilter("");
+    if (!selectedTemplateId) {
+      setTemplateRules([]);
+      return;
+    }
+    setRulesLoading(true);
+    api
+      .listTemplateRules(selectedTemplateId)
+      .then(setTemplateRules)
+      .catch((err) => showError(errMessage(err)))
+      .finally(() => setRulesLoading(false));
+  }, [selectedTemplateId]);
+
+  const filteredTemplateRules = useMemo(() => {
+    const needle = ruleFilter.trim().toLowerCase();
+    if (!needle) return templateRules;
+    return templateRules.filter(
+      (r) => r.rule_id.toLowerCase().includes(needle) || r.title.toLowerCase().includes(needle)
+    );
+  }, [templateRules, ruleFilter]);
+
+  const toggleRuleSelection = (ruleId: string) => {
+    setSelectedRuleIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(ruleId)) next.delete(ruleId);
+      else next.add(ruleId);
+      return next;
+    });
+    // Chọn lại rule thì bản xem trước cũ không còn đúng nữa — bắt xem lại.
+    setPreviewPlaybook(null);
+    setTemplateCreateResult(null);
+  };
+
+  const handlePreviewTemplate = async () => {
+    if (!selectedTemplateId || selectedRuleIds.size === 0) return;
+    setPreviewLoading(true);
+    try {
+      const result = await api.previewTemplatePlaybook(selectedTemplateId, Array.from(selectedRuleIds));
+      setPreviewPlaybook(result.playbook_yaml);
+    } catch (err) {
+      showError(errMessage(err));
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const handleCreateFromTemplate = async () => {
+    if (!selectedTemplateId || previewPlaybook === null) return;
+    setCreatingFromTemplate(true);
+    try {
+      const result = await api.createControlFromTemplate(selectedTemplateId, {
+        title: templateCreateForm.title,
+        category: templateCreateForm.category,
+        description: templateCreateForm.description,
+        rule_ids: Array.from(selectedRuleIds),
+        playbook_yaml: previewPlaybook,
+      });
+      setTemplateCreateResult(result);
+      showSuccess(`Đã tạo Control ${result.control_id} (${result.standard_mappings_added} standard mapping)`);
+    } catch (err) {
+      showError(errMessage(err));
+    } finally {
+      setCreatingFromTemplate(false);
+    }
+  };
+
   const loadControls = () => {
     setLoading(true);
     api
       .listControls()
       .then(setControls)
-      .catch((err) => setSnack({ severity: "error", message: String(err) }))
+      .catch((err) => showError(errMessage(err)))
       .finally(() => setLoading(false));
   };
 
@@ -108,10 +202,10 @@ export default function ControlsPage() {
       await api.createControl(createForm);
       setCreateOpen(false);
       setCreateForm({ title: "", description: "", category: "" });
-      setSnack({ severity: "success", message: "Đã tạo control" });
+      showSuccess("Đã tạo control");
       loadControls();
     } catch (err) {
-      setSnack({ severity: "error", message: err instanceof ApiError ? err.message : String(err) });
+      showError(errMessage(err));
     }
   };
 
@@ -120,12 +214,10 @@ export default function ControlsPage() {
     if (!next) return;
     try {
       await api.updateControlMaturity(control.id, next);
-      setSnack({ severity: "success", message: `Đã chuyển ${control.id} -> ${next}` });
+      showSuccess(`Đã chuyển ${control.id} -> ${next}`);
       loadControls();
     } catch (err) {
-      // 403 four-eyes (không được tự duyệt control của chính mình) là kết quả
-      // mong đợi, không phải lỗi hệ thống — vẫn hiển thị cho người dùng biết.
-      setSnack({ severity: "error", message: err instanceof ApiError ? err.message : String(err) });
+      showError(errMessage(err));
     }
   };
 
@@ -133,13 +225,12 @@ export default function ControlsPage() {
     const next = control.risk_group === "A" ? "B" : "A";
     try {
       await api.updateControlRiskGroup(control.id, next);
-      setSnack({ severity: "success", message: `Đã chuyển ${control.id} sang risk_group ${next}` });
+      showSuccess(`Đã chuyển ${control.id} sang risk_group ${next}`);
       loadControls();
     } catch (err) {
-      // 403 four-eyes hoặc 422 (gán "A" khi chưa production) đều là kết quả
-      // mong đợi từ backend, không phải lỗi hệ thống — vẫn hiển thị cho
-      // người dùng biết (giống handlePromote ở trên).
-      setSnack({ severity: "error", message: err instanceof ApiError ? err.message : String(err) });
+      // 422 (gán "A" khi chưa production) là kết quả mong đợi từ backend,
+      // không phải lỗi hệ thống — vẫn hiển thị cho người dùng biết.
+      showError(errMessage(err));
     }
   };
 
@@ -159,7 +250,7 @@ export default function ControlsPage() {
       const fullDetail = await api.getCanaryRollout(started.id);
       setCanaryRollout(fullDetail);
     } catch (err) {
-      setSnack({ severity: "error", message: err instanceof ApiError ? err.message : String(err) });
+      showError(errMessage(err));
     } finally {
       setCanaryStarting(false);
     }
@@ -174,12 +265,9 @@ export default function ControlsPage() {
       // nên KHÔNG ghi đè canaryRollout bằng response này (sẽ mất mảng hosts
       // vì CanaryRolloutOut không có field đó) — cứ để polling bên dưới bắt
       // trạng thái "aborted" ở lần refresh tiếp theo.
-      setSnack({
-        severity: "success",
-        message: "Đã gửi yêu cầu huỷ — canary rollout sẽ dừng sau khi xử lý xong host hiện tại",
-      });
+      showSuccess("Đã gửi yêu cầu huỷ — canary rollout sẽ dừng sau khi xử lý xong host hiện tại");
     } catch (err) {
-      setSnack({ severity: "error", message: err instanceof ApiError ? err.message : String(err) });
+      showError(errMessage(err));
     }
   };
 
@@ -193,7 +281,7 @@ export default function ControlsPage() {
         .getCanaryRollout(rolloutId)
         .then(setCanaryRollout)
         .catch((err) =>
-          setSnack({ severity: "error", message: err instanceof ApiError ? err.message : String(err) })
+          showError(errMessage(err))
         );
     }, 3000);
     return () => window.clearInterval(intervalId);
@@ -205,7 +293,7 @@ export default function ControlsPage() {
       setDetail(d);
       setHistory(h);
     } catch (err) {
-      setSnack({ severity: "error", message: err instanceof ApiError ? err.message : String(err) });
+      showError(errMessage(err));
     }
   };
 
@@ -214,10 +302,10 @@ export default function ControlsPage() {
     try {
       await api.addStandardMapping(detail.id, mappingForm);
       setMappingForm({ standard: "", standard_version: "", section_id: "" });
-      setSnack({ severity: "success", message: "Đã thêm standard mapping" });
+      showSuccess("Đã thêm standard mapping");
       openDetail(detail.id);
     } catch (err) {
-      setSnack({ severity: "error", message: err instanceof ApiError ? err.message : String(err) });
+      showError(errMessage(err));
     }
   };
 
@@ -229,26 +317,39 @@ export default function ControlsPage() {
         os_version: variantForm.os_version || undefined,
       });
       setVariantForm({ os_family: "", os_version: "", check_method: "", remediation_ref: "" });
-      setSnack({ severity: "success", message: "Đã thêm remediation variant" });
+      showSuccess("Đã thêm remediation variant");
       openDetail(detail.id);
     } catch (err) {
-      setSnack({ severity: "error", message: err instanceof ApiError ? err.message : String(err) });
+      showError(errMessage(err));
     }
   };
 
   return (
     <Stack spacing={2}>
-      <Stack direction="row" justifyContent="space-between" alignItems="center">
-        <Typography variant="h5">Controls</Typography>
-        <Stack direction="row" spacing={1}>
-          <Button variant="outlined" onClick={loadControls}>
-            Tải lại
-          </Button>
-          <Button variant="contained" onClick={() => setCreateOpen(true)}>
-            Tạo control
-          </Button>
-        </Stack>
-      </Stack>
+      <Typography variant="body2" color="text.secondary">
+        Khu vực biên soạn/duyệt nội dung chuẩn (dành cho rule-editor/approver) — để quét máy chủ và
+        sửa lỗi hằng ngày, dùng trang "Kiểm tra & Khắc phục".
+      </Typography>
+      <Tabs value={tab} onChange={(_, v) => setTab(v)}>
+        <Tab label="Controls" />
+        <Tab label="Template" />
+      </Tabs>
+
+      {tab === 0 && (
+    <Stack spacing={2}>
+      <PageHeader
+        title="Controls"
+        actions={
+          <>
+            <Button variant="outlined" onClick={loadControls}>
+              Tải lại
+            </Button>
+            <Button variant="contained" onClick={() => setCreateOpen(true)}>
+              Tạo control
+            </Button>
+          </>
+        }
+      />
 
       {loading ? (
         <CircularProgress />
@@ -320,6 +421,174 @@ export default function ControlsPage() {
             </TableBody>
           </Table>
         </TableContainer>
+      )}
+    </Stack>
+      )}
+
+      {tab === 1 && (
+        <Stack spacing={2}>
+          <Typography variant="body2" color="text.secondary">
+            Chọn rule từ nội dung chuẩn chính thức (ComplianceAsCode/CIS — cùng nguồn dùng cho tính
+            năng "Quét") để tạo Control mới. Bước ký nội dung qua 3 vai trò vẫn phải làm thủ công sau
+            khi tạo — xem đọc kỹ playbook trước khi chọn (1 vài rule như "Disable SSH Root Login" có
+            thể tự khoá SSH nếu áp mặc định).
+          </Typography>
+
+          <FormControl size="small" sx={{ maxWidth: 480 }}>
+            <InputLabel>Template</InputLabel>
+            <Select
+              value={selectedTemplateId}
+              label="Template"
+              onChange={(e) => setSelectedTemplateId(e.target.value)}
+            >
+              {templates.map((t) => (
+                <MenuItem key={t.id} value={t.id}>
+                  {t.title} ({t.rule_count} rule)
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          {selectedTemplateId && (
+            <>
+              <TextField
+                size="small"
+                label="Tìm rule (theo tên hoặc mã)"
+                value={ruleFilter}
+                onChange={(e) => setRuleFilter(e.target.value)}
+                fullWidth
+              />
+
+              {rulesLoading ? (
+                <CircularProgress size={24} />
+              ) : (
+                <TableContainer component={Paper} sx={{ maxHeight: 420 }}>
+                  <Table size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow>
+                        <TableCell padding="checkbox" />
+                        <TableCell>Rule ID</TableCell>
+                        <TableCell>Tiêu đề</TableCell>
+                        <TableCell>Mức độ</TableCell>
+                        <TableCell>Chuẩn tham chiếu</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {filteredTemplateRules.map((r) => (
+                        <TableRow
+                          key={r.rule_id}
+                          hover
+                          onClick={() => toggleRuleSelection(r.rule_id)}
+                          sx={{ cursor: "pointer" }}
+                        >
+                          <TableCell padding="checkbox">
+                            <Checkbox
+                              size="small"
+                              checked={selectedRuleIds.has(r.rule_id)}
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={() => toggleRuleSelection(r.rule_id)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2" fontFamily="monospace">
+                              {r.rule_id}
+                            </Typography>
+                          </TableCell>
+                          <TableCell>{r.title}</TableCell>
+                          <TableCell>
+                            {r.severity && <Chip label={r.severity} size="small" />}
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="caption" color="text.secondary">
+                              {r.compliance_refs.slice(0, 3).join(", ")}
+                              {r.compliance_refs.length > 3 ? " ..." : ""}
+                            </Typography>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                      {filteredTemplateRules.length === 0 && (
+                        <TableRow>
+                          <TableCell colSpan={5} align="center">
+                            Không có rule khớp.
+                          </TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              )}
+
+              <Stack direction="row" spacing={2} alignItems="center">
+                <Typography variant="body2">{selectedRuleIds.size} rule đã chọn</Typography>
+                <Button
+                  variant="outlined"
+                  disabled={selectedRuleIds.size === 0 || previewLoading}
+                  onClick={handlePreviewTemplate}
+                >
+                  {previewLoading ? <CircularProgress size={16} /> : "Xem trước playbook"}
+                </Button>
+              </Stack>
+
+              {previewPlaybook !== null && (
+                <Stack spacing={2}>
+                  <Typography variant="subtitle1">
+                    Playbook ghép sẵn — có thể sửa tay trước khi tạo Control
+                  </Typography>
+                  <TextField
+                    value={previewPlaybook}
+                    onChange={(e) => setPreviewPlaybook(e.target.value)}
+                    multiline
+                    fullWidth
+                    minRows={12}
+                    maxRows={24}
+                    InputProps={{ sx: { fontFamily: "monospace", fontSize: 12 } }}
+                  />
+                  <Stack direction="row" spacing={2} flexWrap="wrap">
+                    <TextField
+                      size="small"
+                      label="Title Control mới"
+                      value={templateCreateForm.title}
+                      onChange={(e) => setTemplateCreateForm({ ...templateCreateForm, title: e.target.value })}
+                    />
+                    <TextField
+                      size="small"
+                      label="Category"
+                      value={templateCreateForm.category}
+                      onChange={(e) => setTemplateCreateForm({ ...templateCreateForm, category: e.target.value })}
+                    />
+                  </Stack>
+                  <TextField
+                    size="small"
+                    label="Description (tuỳ chọn)"
+                    value={templateCreateForm.description}
+                    onChange={(e) => setTemplateCreateForm({ ...templateCreateForm, description: e.target.value })}
+                    multiline
+                    minRows={2}
+                  />
+                  <Button
+                    variant="contained"
+                    disabled={!templateCreateForm.title || !templateCreateForm.category || creatingFromTemplate}
+                    onClick={handleCreateFromTemplate}
+                    sx={{ alignSelf: "flex-start" }}
+                  >
+                    {creatingFromTemplate ? <CircularProgress size={16} /> : "Tạo Control"}
+                  </Button>
+                </Stack>
+              )}
+
+              {templateCreateResult && (
+                <Alert severity="success">
+                  Đã tạo Control <strong>{templateCreateResult.control_id}</strong> (
+                  {templateCreateResult.standard_mappings_added} standard mapping tự động) — trạng
+                  thái <strong>draft</strong>, CHƯA có RemediationVariant. Bước tiếp theo (thủ công):
+                  lưu nội dung playbook ở trên thành file, đưa qua{" "}
+                  <code>scripts/content-signing/pull.sh → review.sh → sign.sh</code>, rồi mở lại
+                  Control này để thêm RemediationVariant trỏ tới bundle đã ký.
+                </Alert>
+              )}
+            </>
+          )}
+        </Stack>
       )}
 
       {/* Tạo control */}
@@ -468,6 +737,33 @@ export default function ControlsPage() {
               <Divider />
 
               <Stack spacing={1}>
+                <Typography variant="subtitle1">Biến có thể override theo host</Typography>
+                {Object.keys(detail.overridable_variables).length > 0 ? (
+                  Object.entries(detail.overridable_variables).map(([name, defaultValue]) => (
+                    <Typography key={name} variant="body2">
+                      <Typography component="span" fontFamily="monospace">
+                        {name}
+                      </Typography>{" "}
+                      — mặc định: {defaultValue}
+                    </Typography>
+                  ))
+                ) : (
+                  <Typography variant="body2" color="text.secondary">
+                    Control này không có biến nào override riêng theo host được (chỉ Control tạo từ
+                    tab "Template" mới có).
+                  </Typography>
+                )}
+                {Object.keys(detail.overridable_variables).length > 0 && (
+                  <Typography variant="caption" color="text.secondary">
+                    Đặt giá trị riêng cho từng host qua menu "⋮" ở trang Hosts → "Override biến
+                    Ansible".
+                  </Typography>
+                )}
+              </Stack>
+
+              <Divider />
+
+              <Stack spacing={1}>
                 <Typography variant="subtitle1">Lịch sử thay đổi</Typography>
                 {history.map((h) => (
                   <Typography key={h.id} variant="body2">
@@ -516,7 +812,7 @@ export default function ControlsPage() {
                   <Chip
                     label={canaryRollout.status}
                     size="small"
-                    color={statusChipColor(canaryRollout.status)}
+                    color={progressColor(canaryRollout.status)}
                   />
                   <Typography variant="body2" color="text.secondary">
                     {canaryRollout.eligible_host_count} host đủ điều kiện
@@ -546,7 +842,7 @@ export default function ControlsPage() {
                             <TableCell>{h.dry_run_job_id ?? "-"}</TableCell>
                             <TableCell>{h.apply_job_id ?? "-"}</TableCell>
                             <TableCell>
-                              <Chip label={h.status} size="small" color={statusChipColor(h.status)} />
+                              <Chip label={h.status} size="small" color={progressColor(h.status)} />
                             </TableCell>
                           </TableRow>
                         ))}
@@ -576,10 +872,6 @@ export default function ControlsPage() {
           )}
         </DialogActions>
       </Dialog>
-
-      <Snackbar open={snack !== null} autoHideDuration={5000} onClose={() => setSnack(null)}>
-        {snack ? <Alert severity={snack.severity}>{snack.message}</Alert> : undefined}
-      </Snackbar>
     </Stack>
   );
 }

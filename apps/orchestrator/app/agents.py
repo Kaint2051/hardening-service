@@ -30,45 +30,49 @@ trạng thái agent — xem kế hoạch đầy đủ đã thống nhất với 
 """
 import base64
 import hmac
+import logging
 import os
 from datetime import datetime, timezone
 
 import httpx
 import jwt as pyjwt
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from app.audit import write_audit_event
-from app.auth import CurrentUser, require_roles
+from app.auth import CurrentUser
 from app.ca_client import (
     create_agent_enrollment_token,
     mint_agent_client_cert,
     mint_agent_manager_server_cert,
-    mint_ssh_certificate,
 )
 from app.config import settings
 from app.db import SessionLocal
-from app.jobs import _call_job_dispatcher, _truncate_backup_b64
+from app.jobs import _call_job_dispatcher, _get_ssh_dispatch_environment, _truncate_backup_b64
 from app.models import AgentEnrollmentToken, AgentFimEvent, Host, Job, RemediationVariant
+from app.permissions import AGENTS_MANAGE
+from app.rbac import require_permission
 from app.schemas import (
     AgentEnrollmentTokenOut,
     AgentFimEventRequest,
     AgentHeartbeatRequest,
     AgentInstallScriptOut,
+    AgentMetricsRequest,
     AgentRemediateClaimRequest,
     AgentRemediateClaimResponse,
     AgentRemediateResultRequest,
     AgentRemediationBundleRequest,
     AgentRemediationBundleResponse,
+    AgentRestoreResultRequest,
     AgentScanResultRequest,
     AgentVerifyEnrollRequest,
     AgentVerifyEnrollResponse,
     JobOut,
 )
 
-router = APIRouter(tags=["agents"])
+logger = logging.getLogger(__name__)
 
-_OPERATOR_ROLES = ("operator", "admin")
+router = APIRouter(tags=["agents"])
 
 
 def _get_db():
@@ -87,7 +91,7 @@ def _require_active_host(db: Session, hostname: str) -> Host:
     if host is None:
         raise HTTPException(status_code=404, detail="host không tồn tại")
     if host.decommissioned_at is not None:
-        raise HTTPException(status_code=422, detail="host đã decommission — recommission trước khi enroll agent")
+        raise HTTPException(status_code=422, detail="host đang tạm ngưng quản lý — khôi phục quản lý trước khi enroll agent")
     return host
 
 
@@ -137,28 +141,40 @@ def _issue_agent_enrollment_token(
     sinh script cài đặt gộp sẵn (create_agent_install_script bên dưới), để
     logic lưu jti/expires_at/audit không bao giờ lệch nhau giữa 2 đường.
 
-    Raises HTTPException(502) nếu step-ca từ chối cấp.
+    Raises HTTPException(502) nếu step-ca từ chối cấp HOẶC nếu bước sổ sách
+    (decode claim/lưu AgentEnrollmentToken) thất bại — PHẢI luôn là
+    HTTPException vì caller duy nhất (trigger_agent_install) chỉ bắt
+    HTTPException để chuyển Job đã tạo (status="running") sang "failed"; 1
+    exception khác lọt qua sẽ để Job đó kẹt MÃI MÃI ở "running" — đúng lớp
+    bug hàm này (và toàn bộ pattern _fail trong trigger_agent_install) được
+    viết ra để tránh (phát hiện qua rà soát: trước đây chỉ create_agent_
+    enrollment_token có bọc, pyjwt.decode/db.add/db.commit bên dưới thì
+    không).
     """
     try:
         token = create_agent_enrollment_token(hostname)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=f"không tạo được enrollment token: {exc}") from exc
 
-    # Chỉ đọc claim để lưu sổ sách (jti/exp) — KHÔNG verify chữ ký ở đây vì
-    # chính Orchestrator vừa tự ký token này qua step-ca; verify chữ ký thật
-    # xảy ra ở step-ca lúc đổi token lấy cert (verify_and_enroll bên dưới).
-    claims = pyjwt.decode(token, options={"verify_signature": False})
-    expires_at = datetime.fromtimestamp(claims["exp"], tz=timezone.utc)
+    try:
+        # Chỉ đọc claim để lưu sổ sách (jti/exp) — KHÔNG verify chữ ký ở đây vì
+        # chính Orchestrator vừa tự ký token này qua step-ca; verify chữ ký thật
+        # xảy ra ở step-ca lúc đổi token lấy cert (verify_and_enroll bên dưới).
+        claims = pyjwt.decode(token, options={"verify_signature": False})
+        expires_at = datetime.fromtimestamp(claims["exp"], tz=timezone.utc)
 
-    db.add(
-        AgentEnrollmentToken(
-            hostname=hostname,
-            jti=claims["jti"],
-            issued_by=user.username,
-            expires_at=expires_at,
+        db.add(
+            AgentEnrollmentToken(
+                hostname=hostname,
+                jti=claims["jti"],
+                issued_by=user.username,
+                expires_at=expires_at,
+            )
         )
-    )
-    db.commit()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=502, detail=f"lưu sổ sách enrollment token thất bại: {exc}") from exc
 
     write_audit_event(
         actor=user.username,
@@ -177,7 +193,7 @@ def _issue_agent_enrollment_token(
 def create_enrollment_token(
     hostname: str,
     db: Session = Depends(_get_db),
-    user: CurrentUser = Depends(require_roles(*_OPERATOR_ROLES)),
+    user: CurrentUser = Depends(require_permission(AGENTS_MANAGE)),
 ) -> AgentEnrollmentTokenOut:
     _require_active_host(db, hostname)
     return _issue_agent_enrollment_token(db, hostname, user)
@@ -285,7 +301,7 @@ echo "roi chay tay: systemctl enable --now hardening-executor.service"
 def create_agent_install_script(
     hostname: str,
     db: Session = Depends(_get_db),
-    user: CurrentUser = Depends(require_roles(*_OPERATOR_ROLES)),
+    user: CurrentUser = Depends(require_permission(AGENTS_MANAGE)),
 ) -> AgentInstallScriptOut:
     _require_active_host(db, hostname)
 
@@ -332,8 +348,9 @@ def _parse_agent_install_summary(logs: str) -> dict:
 )
 def trigger_agent_install(
     hostname: str,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(_get_db),
-    user: CurrentUser = Depends(require_roles(*_OPERATOR_ROLES)),
+    user: CurrentUser = Depends(require_permission(AGENTS_MANAGE)),
 ) -> Job:
     """Remote-deploy Agent tự động — KHÁC create_agent_install_script (dán
     tay): tự SSH bằng cert ephemeral (đúng cơ chế trigger_ssh_check,
@@ -356,7 +373,12 @@ def trigger_agent_install(
     RIÊNG, tự đánh Job "failed" trước khi raise lại — tránh lớp bug "Job kẹt
     vĩnh viễn ở status running" đã từng gặp (xem docstring mint_ssh_certificate/
     _call_job_dispatcher), vì hàm này (khác create_agent_install_script) tạo
-    Job row TRƯỚC khi làm các bước có thể lỗi.
+    Job row TRƯỚC khi làm các bước có thể lỗi. Các bước này VẪN ĐỒNG BỘ (lỗi
+    502 trả nhanh như trước) — CHỈ phần chờ job-dispatcher chạy xong container
+    (`_call_job_dispatcher`, tới 150s) được đưa vào `background_tasks` (xem
+    `_dispatch_agent_install_job`), để response trả về NGAY với Job còn
+    "running", cho phép frontend poll `GET /jobs/{id}/progress` — mục
+    "progress bar % thật cho Test SSH/Cài Agent".
     """
     host = _require_active_host(db, hostname)
 
@@ -418,7 +440,7 @@ def trigger_agent_install(
         raise HTTPException(status_code=http_status, detail=detail) from cause
 
     try:
-        private_key, cert_pub = mint_ssh_certificate(principal=host.ssh_user)
+        ssh_auth_env = _get_ssh_dispatch_environment(host, principal=host.ssh_user)
     except RuntimeError as exc:
         _fail("ca_mint_failed", f"không cấp được SSH cert cho job: {exc}", 502, exc)
 
@@ -439,39 +461,95 @@ def trigger_agent_install(
         "command": ["agent-install"],
         "environment": {
             "TARGET_HOST": host.ip_address,
+            "TARGET_PORT": str(host.ssh_port),
             "SSH_USER": host.ssh_user,
-            "SSH_KEY_B64": base64.b64encode(private_key.encode()).decode(),
-            "SSH_CERT_B64": base64.b64encode(cert_pub.encode()).decode(),
+            **ssh_auth_env,
             "AGENT_HOSTNAME": host.hostname,
             "AGENT_BUNDLE_REF": settings.agent_bundle_ref,
             "AGENT_BUNDLE_TRUSTED_FINGERPRINT": settings.agent_bundle_trusted_fingerprint,
             "AGENT_ENROLL_TOKEN_B64": base64.b64encode(token_out.token.encode()).decode(),
             "CA_ROOT_PEM_B64": base64.b64encode(ca_root_pem.encode()).decode(),
             "AGENT_MANAGER_PUBLIC_URL": settings.agent_manager_public_url,
+            # Để agent-install.sh chuẩn bị sẵn /etc/hardening-agent/executor.env
+            # + import public key content-signing vào keyring root máy đích —
+            # thiếu 2 thứ này thì Executor (nếu operator bật) hoặc Fatal lúc
+            # khởi động, hoặc từ chối MỌI bundle remediation. Đây là fingerprint
+            # nội dung REMEDIATION, khác agent_bundle_trusted_fingerprint (bundle
+            # cài đặt Agent) ở trên.
+            "CONTENT_SIGNING_TRUSTED_FINGERPRINT": settings.content_signing_trusted_fingerprint,
         },
         "timeout_seconds": 120,
     }
 
-    try:
-        result = _call_job_dispatcher(dispatch_body, timeout=150)
-    except httpx.HTTPError as exc:
-        _fail("dispatcher_call_failed", f"job-dispatcher lỗi: {exc}", 502, exc)
-
-    summary = _parse_agent_install_summary(result.get("logs", ""))
-    summary["exit_code"] = result.get("exit_code")
-    job.status = "succeeded" if result.get("exit_code") == 0 else "failed"
-    job.result_summary = summary
-    job.finished_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(job)
-
-    write_audit_event(
-        actor=user.username,
-        action="agent_install_completed",
-        resource=hostname,
-        payload={"job_id": job.id, "status": job.status},
-    )
+    background_tasks.add_task(_dispatch_agent_install_job, job.id, hostname, user.username, dispatch_body)
     return job
+
+
+def _dispatch_agent_install_job(job_id: int, hostname: str, triggered_by: str, dispatch_body: dict) -> None:
+    """Phần CHỜ job-dispatcher chạy xong của trigger_agent_install — chạy
+    trong BackgroundTasks (xem docstring trigger_agent_install). Mở
+    SessionLocal() RIÊNG (session request-scoped đã đóng ngay khi response
+    được gửi), cùng pattern app/canary.py:_run_rollout và
+    app/jobs.py:_dispatch_ssh_check_job.
+
+    Bọc try/except Exception NGOÀI CÙNG (không chỉ httpx.HTTPError) — nếu
+    không, 1 lỗi không lường được sẽ khiến Job kẹt vĩnh viễn ở "running" vì
+    không còn ai chờ nhận exception như lúc còn chạy đồng bộ trong request.
+    """
+    db = SessionLocal()
+    try:
+        job = db.get(Job, job_id)
+        if job is None:
+            return
+
+        try:
+            result = _call_job_dispatcher(dispatch_body, timeout=150)
+        except httpx.HTTPError as exc:
+            job.status = "failed"
+            job.result_summary = {"error": str(exc)}
+            job.finished_at = datetime.now(timezone.utc)
+            db.commit()
+            write_audit_event(
+                actor=triggered_by, action="agent_install_failed", resource=hostname,
+                payload={"job_id": job.id, "error": "dispatcher_call_failed"},
+            )
+            return
+
+        summary = _parse_agent_install_summary(result.get("logs", ""))
+        summary["exit_code"] = result.get("exit_code")
+        job.status = "succeeded" if result.get("exit_code") == 0 else "failed"
+        job.result_summary = summary
+        job.finished_at = datetime.now(timezone.utc)
+        db.commit()
+
+        write_audit_event(
+            actor=triggered_by,
+            action="agent_install_completed",
+            resource=hostname,
+            payload={"job_id": job.id, "status": job.status},
+        )
+    except Exception:
+        logger.exception("agent-install job %s: lỗi ngoài dự kiến trong background dispatch", job_id)
+        try:
+            db.rollback()
+            job = db.get(Job, job_id)
+            if job is not None and job.status == "running":
+                job.status = "failed"
+                job.result_summary = {"error": "internal_error"}
+                job.finished_at = datetime.now(timezone.utc)
+                db.commit()
+                write_audit_event(
+                    actor=triggered_by, action="agent_install_failed", resource=hostname,
+                    payload={"job_id": job_id, "error": "internal_error"},
+                )
+        except Exception:
+            logger.exception(
+                "agent-install job %s: KHÔNG THỂ đánh 'failed' sau lỗi ngoài dự kiến — kẹt "
+                "'running' tới lần Orchestrator khởi động lại kế tiếp "
+                "(reconcile_orphaned_remediate_jobs tự dọn lúc đó)", job_id,
+            )
+    finally:
+        db.close()
 
 
 @router.post("/internal/agent/verify-and-enroll", response_model=AgentVerifyEnrollResponse)
@@ -595,6 +673,71 @@ def agent_heartbeat(
     if host is None:
         raise HTTPException(status_code=404, detail="host không tồn tại")
     host.agent_last_seen = datetime.now(timezone.utc)
+
+    # Chỉ cập nhật khi Agent BÁO CÁO giá trị thật khác giá trị đang lưu —
+    # thiếu field/rỗng KHÔNG được coi là "xoá" (khác semantics ssh_password
+    # của HostUpdate): Agent không nhận diện được OS ở 1 lần heartbeat không
+    # có nghĩa os_family đã biết trước đó bỗng trở thành "không xác định".
+    # Audit CHỈ ghi lúc thật sự đổi — heartbeat lặp mỗi ~60s, ghi audit mỗi
+    # lần dù không đổi gì sẽ làm audit log trôi mất giữa hàng nghìn dòng vô
+    # nghĩa (khác lớp "xem SSH password" cố tình audit mọi lần, vì đó là hành
+    # động NHẠY CẢM, không phải máy tự báo cáo định kỳ).
+    os_changes: dict[str, str] = {}
+    if body.os_family and body.os_family != host.os_family:
+        os_changes["os_family"] = body.os_family
+        host.os_family = body.os_family
+    if body.os_version and body.os_version != host.os_version:
+        os_changes["os_version"] = body.os_version
+        host.os_version = body.os_version
+    db.commit()
+
+    if os_changes:
+        write_audit_event(
+            actor="agent-manager",
+            action="agent_os_info_updated",
+            resource=body.hostname,
+            payload=os_changes,
+        )
+
+
+@router.post("/internal/agent/host-metrics", status_code=status.HTTP_204_NO_CONTENT)
+def agent_metrics(
+    body: AgentMetricsRequest,
+    db: Session = Depends(_get_db),
+    authorization: str | None = Header(default=None),
+) -> None:
+    """Ghi đè Host.metrics tại chỗ — KHÔNG ghi audit event mỗi lần, cùng lý
+    do agent_heartbeat ở trên (lặp mỗi ~3 phút, còn dày hơn heartbeat, ghi
+    audit mỗi lần sẽ làm ngập audit log với dữ liệu không có ý nghĩa điều
+    tra). Host.metrics_updated_at là nguồn sự thật duy nhất về độ mới của số
+    liệu này — UI tự cảnh báo "dữ liệu cũ" từ đó, không cần audit log.
+    """
+    _check_agent_manager_auth(authorization)
+    host = db.get(Host, body.hostname)
+    if host is None:
+        raise HTTPException(status_code=404, detail="host không tồn tại")
+    metrics: dict[str, float | str] = {
+        "cpu_pct": body.cpu_pct,
+        "ram_pct": body.ram_pct,
+        "disk_pct": body.disk_pct,
+    }
+    if body.net_iface:
+        metrics["net_iface"] = body.net_iface
+    if body.net_pct is not None:
+        metrics["net_pct"] = body.net_pct
+    if body.executor_reachable is not None:
+        metrics["executor_reachable"] = body.executor_reachable
+    host.metrics = metrics
+    host.metrics_updated_at = datetime.now(timezone.utc)
+
+    # system_info ghi vào CỘT KHÁC (Host.system_info, không phải
+    # Host.metrics) — cùng 2 cột ssh-check.sh đang cập nhật, chỉ khác nguồn
+    # gọi, nên host quản lý HOÀN TOÀN qua Agent (chưa từng "Test SSH") vẫn có
+    # đủ dữ liệu cho dialog "Thông tin máy" phía UI mà KHÔNG cần đổi gì ở đó.
+    if body.system_info:
+        host.system_info = body.system_info
+        host.system_info_updated_at = datetime.now(timezone.utc)
+
     db.commit()
 
 
@@ -608,11 +751,21 @@ def agent_scan_result(
     if db.get(Host, body.hostname) is None:
         raise HTTPException(status_code=404, detail="host không tồn tại")
 
+    # PHẢI đọc scan_job_status thật (quy ước của apps/agent/scan.go:
+    # "completed" = scan chạy xong, dù có finding fail hay không; "error" =
+    # oscap lỗi/timeout/thiếu datastream, KHÔNG có "findings" trong payload).
+    # Trước đây hardcode "succeeded" bất kể nội dung — 1 agent-scan lỗi thật
+    # (vd thiếu file datastream trên máy đích) vẫn hiện "succeeded" với 0
+    # finding, dễ khiến người dùng tưởng máy đã đạt chuẩn hoàn toàn. Cùng quy
+    # ước với trigger_scan (nhánh SSH) suy status từ exit_code thật, không
+    # phải khai báo cố định.
+    job_status = "succeeded" if body.result_summary.get("scan_job_status") == "completed" else "failed"
+
     job = Job(
         hostname=body.hostname,
         job_type="agent-scan",
         scap_profile=body.scap_profile,
-        status="succeeded",
+        status=job_status,
         result_summary=body.result_summary,
         triggered_by="agent",
         started_at=datetime.now(timezone.utc),
@@ -692,7 +845,10 @@ def claim_remediate_job(
         .filter(
             Job.hostname == body.hostname,
             Job.status == "pending",
-            Job.job_type.in_(("remediate-dry-run", "remediate-apply")),
+            # "restore" tham gia CÙNG endpoint claim này (không thêm poll
+            # loop/endpoint riêng phía Agent) — xem app/jobs.py:
+            # _dispatch_restore_job_via_agent.
+            Job.job_type.in_(("remediate-dry-run", "remediate-apply", "restore")),
         )
         .order_by(Job.id.asc())
         .with_for_update(skip_locked=True)
@@ -711,6 +867,9 @@ def claim_remediate_job(
     # (coi như không có job, KHÔNG claim) — job vẫn "pending" trong DB, tự
     # bị AGENT_REMEDIATE_DISPATCH_TIMEOUT phía Orchestrator đánh "failed"
     # sau đó như đường timeout thông thường, không cần cơ chế cancel riêng.
+    # Áp DÙNG CHUNG cho restore — restore qua Agent cũng là 1 hành động ghi
+    # đè cấu hình thật trên host đích, cùng mức rủi ro với remediate, không
+    # có lý do miễn trừ riêng.
     if not settings.active_response_enabled or not host.active_response_enabled or host.agent_renewal_blocked:
         write_audit_event(
             actor="agent-manager",
@@ -719,6 +878,26 @@ def claim_remediate_job(
             payload={"job_id": job.id, "control_id": job.control_id},
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    if job.job_type == "restore":
+        # Backup KHÔNG nằm trên chính Job "restore" này — nó là kết quả của
+        # 1 Job "remediate-apply" TRƯỚC đó, tham chiếu qua source_job_id (đã
+        # lưu vào result_summary lúc chuyển "pending", xem app/jobs.py:
+        # _dispatch_restore_job_via_agent).
+        source_job_id = (job.result_summary or {}).get("source_job_id")
+        source_job = db.get(Job, source_job_id) if source_job_id else None
+        backup_b64 = (source_job.result_summary or {}).get("backup_tar_b64") if source_job else None
+        if not backup_b64:
+            # Không nên xảy ra — run_restore đã validate backup TRƯỚC khi
+            # chuyển job "pending" — từ chối rõ ràng thay vì claim rồi gửi
+            # Agent 1 backup rỗng.
+            raise HTTPException(
+                status_code=500, detail="restore job thiếu backup_tar_b64 từ source_job (không nên xảy ra)"
+            )
+        job.status = "running"
+        db.commit()
+        db.refresh(job)
+        return AgentRemediateClaimResponse(job_id=job.id, job_kind="restore", backup_tar_b64=backup_b64)
 
     variant = db.get(RemediationVariant, job.remediation_variant_id)
     if variant is None:
@@ -733,6 +912,7 @@ def claim_remediate_job(
 
     return AgentRemediateClaimResponse(
         job_id=job.id,
+        job_kind="remediate",
         control_id=job.control_id,
         remediation_ref=variant.remediation_ref,
         dry_run=(job.job_type == "remediate-dry-run"),
@@ -903,5 +1083,65 @@ def report_remediate_result(
         action="agent_remediate_result_reported",
         resource=body.hostname,
         payload={"job_id": job.id, "status": job.status, "dry_run": body.dry_run},
+    )
+    return {}
+
+
+@router.post("/internal/agent/restore-result")
+def report_restore_result(
+    body: AgentRestoreResultRequest,
+    db: Session = Depends(_get_db),
+    authorization: str | None = Header(default=None),
+) -> dict:
+    """Agent báo kết quả job "restore" — TÁCH RIÊNG khỏi
+    report_remediate_result vì shape khác hẳn (không dry_run/diff_output/
+    backup_tar_b64 mới — restore CONSUME 1 backup có sẵn từ source_job,
+    không tạo backup mới). result_summary đích cố ý khớp ĐÚNG shape đường
+    SSH (`raw_log_tail`/`exit_code`/`source_job_id`, xem app/jobs.py:
+    run_restore) — 1 job "restore" ra result_summary giống nhau bất kể qua
+    đường nào, giữ nguyên source_job_id đã lưu tạm lúc chuyển "pending".
+    """
+    _check_agent_manager_auth(authorization)
+
+    job = db.get(Job, body.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job không tồn tại")
+    if job.hostname != body.hostname:
+        raise HTTPException(status_code=422, detail="job_id không khớp hostname")
+    if job.status != "running":
+        # Cùng lý do report_remediate_result ở trên (chặn report trùng/lệch
+        # thời điểm) — không lặp lại toàn văn giải thích, xem hàm đó.
+        write_audit_event(
+            actor="agent-manager",
+            action="agent_restore_result_discarded_not_running",
+            resource=body.hostname,
+            payload={"job_id": job.id, "job_status": job.status, "exit_code": body.exit_code},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=f"job đang ở status '{job.status}', không phải 'running' — có thể đã report trước đó hoặc chưa được claim",
+        )
+
+    source_job_id = (job.result_summary or {}).get("source_job_id")
+    summary: dict = {
+        "raw_log_tail": body.log_tail[-2000:] if body.log_tail else body.log_tail,
+        "exit_code": body.exit_code,
+        "source_job_id": source_job_id,
+        "dispatch_via": "agent",
+    }
+    if body.error is not None:
+        summary["error"] = body.error
+
+    job.status = "succeeded" if body.exit_code == 0 else "failed"
+    job.result_summary = summary
+    job.finished_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(job)
+
+    write_audit_event(
+        actor="agent-manager",
+        action="agent_restore_result_reported",
+        resource=body.hostname,
+        payload={"job_id": job.id, "source_job_id": source_job_id, "status": job.status},
     )
     return {}
