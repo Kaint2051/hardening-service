@@ -38,6 +38,11 @@ THẬT của Active Response nằm ở Orchestrator (`active_response_enabled`, 
    - `AGENT_FIM_INTERVAL` (mặc định `5m`), `AGENT_FIM_PATHS` (danh sách
      path phân cách dấu phẩy, mặc định `/etc/ssh/sshd_config,/etc/passwd,
      /etc/shadow`).
+   - `AGENT_METRICS_INTERVAL` (mặc định `3m`) — cadence báo số liệu tài
+     nguyên CPU/RAM/Disk/Network (`metrics.go`) lên `Host.metrics` phía
+     Orchestrator, hiển thị ở dialog "Thông tin máy" (web) — TÁCH RIÊNG
+     khỏi `AGENT_HEARTBEAT_INTERVAL` vì cần ~1s sleep để lấy delta CPU/
+     network mỗi lần đo.
    - `AGENT_REMEDIATE_POLL_INTERVAL` (mặc định `15s`), `AGENT_CONTENT_CACHE_DIR`
      (mặc định `/var/cache/hardening-agent/content` — PHẢI trùng path vật lý
      với `EXECUTOR_SIGNED_CONTENT_DIR` phía Executor), `AGENT_EXECUTOR_SOCKET_PATH`

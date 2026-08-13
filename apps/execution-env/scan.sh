@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # Agentless OpenSCAP scan qua SSH (mục 7 roadmap: "agentless qua
 # Ansible+OpenSCAP cho 1 benchmark CIS"). Dùng oscap-ssh (từ openscap-utils) —
-# LƯU Ý: oscap-ssh chỉ upload nội dung SCAP qua scp, máy đích vẫn cần cài sẵn
-# gói openscap-scanner (cung cấp binary `oscap`) — đây không phải zero-install
-# hoàn toàn, khác với Ansible (chỉ cần Python).
+# LƯU Ý: oscap-ssh chỉ upload nội dung SCAP qua scp, máy đích vẫn cần binary
+# `oscap` (gói openscap-scanner) — script này tự SSH cài gói đó (apt) nếu máy
+# đích chưa có (xem đoạn "Kiểm tra 'oscap'..." bên dưới), operator không cần
+# tự SSH tay vào cài trước, KHÁC hẳn trạng thái ban đầu ("không phải
+# zero-install hoàn toàn như Ansible") — vẫn cần máy đích có apt + Internet.
 #
 # Input qua biến môi trường (do job-dispatcher truyền vào lúc `docker run`):
-#   TARGET_HOST, SSH_USER, SSH_KEY_B64, SSH_CERT_B64  — cert SSH ngắn hạn do
-#     Orchestrator cấp riêng cho job này (xem app/ca_client.py)
+#   TARGET_HOST, SSH_USER, SSH_KEY_B64 — luôn có
+#   SSH_CERT_B64 — TUỲ CHỌN: có nếu Orchestrator cấp cert SSH ngắn hạn (xem
+#     app/ca_client.py, mặc định); THIẾU nếu host đã cấu hình static SSH key
+#     (app/models.py:Host.static_ssh_private_key_encrypted, xem app/jobs.py:
+#     _get_ssh_dispatch_environment) — SSH_KEY_B64 khi đó tự đủ để auth,
+#     không cần CertificateFile.
+#   TARGET_PORT — cổng SSH của host (Host.ssh_port, mặc định 22)
 #   SCAP_PROFILE   — vd xccdf_org.ssgproject.content_profile_cis_level1_server
 #   SCAP_DATASTREAM — đường dẫn datastream trong image, vd
 #     /usr/share/xml/scap/ssg/content/ssg-ubuntu2204-ds.xml
@@ -15,20 +22,54 @@ set -euo pipefail
 : "${TARGET_HOST:?thiếu TARGET_HOST}"
 : "${SSH_USER:?thiếu SSH_USER}"
 : "${SSH_KEY_B64:?thiếu SSH_KEY_B64}"
-: "${SSH_CERT_B64:?thiếu SSH_CERT_B64}"
+SSH_CERT_B64="${SSH_CERT_B64:-}"
+: "${TARGET_PORT:?thiếu TARGET_PORT}"
 : "${SCAP_PROFILE:?thiếu SCAP_PROFILE}"
 : "${SCAP_DATASTREAM:?thiếu SCAP_DATASTREAM}"
 
 mkdir -p /tmp/ssh
 echo "$SSH_KEY_B64" | base64 -d > /tmp/ssh/job_key
-echo "$SSH_CERT_B64" | base64 -d > /tmp/ssh/job_key-cert.pub
 chmod 600 /tmp/ssh/job_key
-chmod 644 /tmp/ssh/job_key-cert.pub
+SSH_OPTS=(-i /tmp/ssh/job_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes)
+SSH_ADDITIONAL_OPTIONS="-i /tmp/ssh/job_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+if [ -n "$SSH_CERT_B64" ]; then
+  echo "$SSH_CERT_B64" | base64 -d > /tmp/ssh/job_key-cert.pub
+  chmod 644 /tmp/ssh/job_key-cert.pub
+  SSH_OPTS+=(-o CertificateFile=/tmp/ssh/job_key-cert.pub)
+  SSH_ADDITIONAL_OPTIONS="$SSH_ADDITIONAL_OPTIONS -o CertificateFile=/tmp/ssh/job_key-cert.pub"
+fi
+export SSH_ADDITIONAL_OPTIONS
 
-export SSH_ADDITIONAL_OPTIONS="-i /tmp/ssh/job_key -o CertificateFile=/tmp/ssh/job_key-cert.pub -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+# oscap-ssh chỉ upload NỘI DUNG SCAP qua scp, máy đích vẫn cần tự có binary
+# `oscap` (gói openscap-scanner) — tự cài qua chính phiên SSH đang có sẵn
+# ở đây (giống hệt cách agent-install.sh đã SSH vào cài Agent), operator
+# không cần tự SSH tay vào máy đích trước khi scan lần đầu (phát hiện qua
+# test thật: oscap-ssh báo "oscap: command not found", máy đích thiếu gói).
+# Chỉ hỗ trợ apt (Debian/Ubuntu) — khớp đúng phạm vi distro SCAP_PROFILES
+# đang hỗ trợ, xem app/jobs.py.
+echo "Kiểm tra 'oscap' đã có trên máy đích chưa..."
+set +e
+ssh "${SSH_OPTS[@]}" -p "$TARGET_PORT" "${SSH_USER}@${TARGET_HOST}" 'command -v oscap >/dev/null 2>&1'
+OSCAP_PRESENT=$?
+set -e
+
+if [ "$OSCAP_PRESENT" -ne 0 ]; then
+  echo "Chưa có 'oscap' trên máy đích — tự cài gói openscap-scanner qua SSH..."
+  set +e
+  ssh "${SSH_OPTS[@]}" -p "$TARGET_PORT" "${SSH_USER}@${TARGET_HOST}" \
+    'command -v apt-get >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openscap-scanner'
+  INSTALL_RC=$?
+  set -e
+  if [ "$INSTALL_RC" -ne 0 ]; then
+    echo "SCAN_JOB_STATUS=error"
+    echo "Tự cài openscap-scanner thất bại trên máy đích (rc=$INSTALL_RC) — kiểm tra máy đích có apt-get + repo/Internet không, hoặc tự cài tay (apt-get install -y openscap-scanner) rồi scan lại."
+    exit 1
+  fi
+  echo "Đã cài xong openscap-scanner trên máy đích."
+fi
 
 set +e
-oscap-ssh "${SSH_USER}@${TARGET_HOST}" 22 xccdf eval \
+oscap-ssh "${SSH_USER}@${TARGET_HOST}" "$TARGET_PORT" xccdf eval \
   --profile "$SCAP_PROFILE" \
   --results /tmp/results.xml \
   --report /tmp/report.html \

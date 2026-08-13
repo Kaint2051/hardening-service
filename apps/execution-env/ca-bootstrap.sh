@@ -16,15 +16,17 @@
 #
 # Input qua biến môi trường:
 #   TARGET_HOST, LEGACY_SSH_USER, CA_SSH_USER_PUBKEY (public key, KHÔNG bí mật)
+#   TARGET_PORT — cổng SSH của host (Host.ssh_port, mặc định 22)
 #   ĐÚNG 1 TRONG 2: LEGACY_SSH_PASSWORD_B64 hoặc LEGACY_SSH_PRIVATE_KEY_B64
 set -euo pipefail
 : "${TARGET_HOST:?thiếu TARGET_HOST}"
 : "${LEGACY_SSH_USER:?thiếu LEGACY_SSH_USER}"
 : "${CA_SSH_USER_PUBKEY:?thiếu CA_SSH_USER_PUBKEY}"
+: "${TARGET_PORT:?thiếu TARGET_PORT}"
 
 mkdir -p /tmp/legacy-ssh
 chmod 700 /tmp/legacy-ssh
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p "${TARGET_PORT}")
 
 if [ -n "${LEGACY_SSH_PRIVATE_KEY_B64:-}" ]; then
   echo "$LEGACY_SSH_PRIVATE_KEY_B64" | base64 -d > /tmp/legacy-ssh/key

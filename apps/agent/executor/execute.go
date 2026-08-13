@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/base64"
@@ -366,4 +367,110 @@ func executeRemediation(cfg executorConfig, env jobEnvelope) executionResult {
 		result.BackupTarB64 = backupB64
 	}
 	return result
+}
+
+// executeRestore giải nén backup base64 (KHÔNG qua đường verify GPG — khác
+// remediation bundle; mô hình tin cậy giữ NGUYÊN như đường SSH hiện có,
+// apps/execution-env/restore.sh: backup blob không có chữ ký riêng, tin cậy
+// nhờ đã đi qua DB/kênh mTLS đã xác thực của Orchestrator, xem app/jobs.py:
+// run_restore) đè lên các path đã backup, rồi CHỈ reload sshd nếu `sshd -t`
+// pass — mirror ĐÚNG logic an toàn của restore.sh (không reload nếu config
+// lỗi, để nguyên file trên đĩa cho operator tự soát) nhưng chạy LOCAL
+// (Executor đã root ngay trên máy đích, không cần round-trip SSH).
+func executeRestore(cfg executorConfig, env jobEnvelope) executionResult {
+	raw, err := base64.StdEncoding.DecodeString(env.BackupTarB64)
+	if err != nil {
+		return executionResult{Verified: true, Executed: false, Reason: fmt.Sprintf("backup_tar_b64 không decode được: %v", err)}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.remediationTimeout)
+	defer cancel()
+
+	extractCode, extractOutput, err := runTarExtractToRoot(ctx, raw)
+	if err != nil {
+		return executionResult{Verified: true, Executed: false, Reason: fmt.Sprintf("giải nén backup thất bại: %v", err), LogTail: tail(extractOutput, 4000)}
+	}
+	if extractCode != 0 {
+		return executionResult{
+			Verified: true, Executed: false,
+			Reason:  fmt.Sprintf("tar xzf giải nén backup thoát mã %d", extractCode),
+			LogTail: tail(extractOutput, 4000),
+		}
+	}
+
+	// sshd_config nằm trong phạm vi backup (/etc/ssh) — kiểm tra hợp lệ
+	// TRƯỚC khi reload, tránh tự khoá SSH nếu backup vì lý do nào đó không
+	// toàn vẹn. KHÔNG reload nếu test lỗi — để nguyên file đã ghi trên đĩa,
+	// báo lỗi rõ ràng cho operator tự kiểm tra tay thay vì reload mù rồi mất
+	// kết nối (y hệt restore.sh:60-71, chỉ khác chạy local không qua SSH).
+	testCode, testOutput, testErr := runSimpleCommand(ctx, "sshd", "-t")
+	if testErr != nil || testCode != 0 {
+		return executionResult{
+			Verified: true, Executed: false,
+			Reason: fmt.Sprintf(
+				"sshd_config sau restore KHÔNG hợp lệ (sshd -t thoát mã %d) — ĐÃ giải nén backup lên đĩa "+
+					"nhưng KHÔNG reload để tránh tự khoá SSH, cần vào tay kiểm tra: %v", testCode, testErr,
+			),
+			LogTail: tail(extractOutput+"\n"+testOutput, 4000),
+		}
+	}
+
+	// reload sshd, fallback ssh — cùng cách restore.sh làm
+	// (`systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true`).
+	reloadCode, reloadOutput, _ := runSimpleCommand(ctx, "systemctl", "reload", "sshd")
+	if reloadCode != 0 {
+		reloadCode, reloadOutput, _ = runSimpleCommand(ctx, "systemctl", "reload", "ssh")
+	}
+	return executionResult{
+		Verified: true, Executed: true, ExitCode: reloadCode,
+		LogTail: tail(extractOutput+"\n"+testOutput+"\n"+reloadOutput, 4000),
+	}
+}
+
+// runTarExtractToRoot chạy `tar xzf - -C /` với stdin là backup đã decode —
+// KHÔNG dùng archive/tar của Go như extractBundleFromReader (bundle không
+// đáng tin, cần chống zip-slip/zip-bomb) vì backup ở đây do CHÍNH Orchestrator
+// đã xác thực chuyển xuống (mirror ĐÚNG cách restore.sh gọi `tar xzf -` thẳng
+// qua SSH, không có lớp kiểm tra path riêng nào ở đó cả).
+func runTarExtractToRoot(ctx context.Context, data []byte) (exitCode int, output string, err error) {
+	cmd := exec.CommandContext(ctx, "tar", "xzf", "-", "-C", "/")
+	cmd.Stdin = bytes.NewReader(data)
+	return runCmd(ctx, cmd)
+}
+
+// runSimpleCommand chạy 1 lệnh hệ thống ngắn (sshd -t, systemctl reload...)
+// — cùng pattern chống treo Setpgid+Cancel+WaitDelay như runAnsiblePlaybook/
+// captureBackup ở trên, tách riêng vì 2 hàm đó có tham số/semantics đặc thù
+// riêng (ansible args, bỏ qua exit code khác 0) không dùng chung được.
+func runSimpleCommand(ctx context.Context, name string, args ...string) (exitCode int, output string, err error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	return runCmd(ctx, cmd)
+}
+
+func runCmd(ctx context.Context, cmd *exec.Cmd) (exitCode int, output string, err error) {
+	var outBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &outBuf
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = 5 * time.Second
+
+	if startErr := cmd.Start(); startErr != nil {
+		return -1, "", fmt.Errorf("khởi động %s thất bại: %w", cmd.Path, startErr)
+	}
+	runErr := cmd.Wait()
+
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return -1, outBuf.String(), fmt.Errorf("%s vượt timeout, đã bị kill", cmd.Path)
+	}
+	if runErr == nil {
+		return 0, outBuf.String(), nil
+	}
+	exitErr, ok := runErr.(*exec.ExitError)
+	if !ok {
+		return -1, outBuf.String(), fmt.Errorf("chạy %s thất bại: %w", cmd.Path, runErr)
+	}
+	return exitErr.ExitCode(), outBuf.String(), nil
 }

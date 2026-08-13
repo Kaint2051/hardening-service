@@ -31,9 +31,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         # trigger_ca_bootstrap). Đọc password qua -f <file> (không phải -p
         # <chuỗi>) để tránh lộ qua `ps aux`.
         sshpass \
+        # static-ssh-key-bootstrap.sh dùng mã hoá private key mới sinh (key/
+        # iv raw, KHÔNG qua -pass/-pbkdf2) trước khi in ra stdout — xem
+        # app/jobs.py:trigger_static_ssh_key_bootstrap. Cài rõ ràng, không
+        # suy đoán có sẵn qua dependency khác.
+        openssl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir --break-system-packages ansible-runner==2.4.0
+
+# Datastream STIG cho Ubuntu 22.04 (DISA "Canonical Ubuntu 22.04 LTS STIG
+# V2R7") — gói apt ssg-debderived (0.1.65-1) chỉ có profile CIS/standard,
+# KHÔNG có stig. Vendor riêng 1 file từ đúng release ComplianceAsCode chính
+# thức (v0.1.81, sha512 đã verify trước khi thêm vào repo — xem
+# control-templates/README.md, cùng nguồn dùng cho tab Template) thay vì
+# nâng cấp/thay thế file CIS đang chạy — giữ nguyên 100% hành vi scan CIS
+# hiện có, chỉ CỘNG THÊM khả năng chọn profile STIG. Đặt tên khác file apt
+# cài (ssg-ubuntu2204-ds.xml) để không đụng nhau, dù file này thực ra chứa
+# đủ cả profile CIS lẫn STIG — chỉ dùng đúng profile "stig" của nó qua
+# SCAP_PROFILES (app/jobs.py), không dùng để scan CIS (vẫn dùng file apt).
+COPY ssg-ubuntu2204-stig-ds.xml /usr/share/xml/scap/ssg/content/ssg-ubuntu2204-stig-ds.xml
+
+# Datastream CIS cho Ubuntu 24.04 — gói apt ssg-debderived (0.1.65-1, Debian
+# bookworm) KHÔNG có product ubuntu2404 (ComplianceAsCode chỉ thêm hỗ trợ
+# 24.04 từ v0.1.76 trở đi, mãi mãi không tự vào được qua apt vì Debian
+# stable không nâng version gói này). Vendor riêng file này từ CÙNG release
+# v0.1.81 đã dùng cho STIG ở trên (sha512 tarball đã verify khớp công bố
+# chính thức trước khi trích xuất) — chỉ mở rộng "Quét" (scan), KHÔNG kèm
+# nội dung remediation cho 24.04 (vẫn cần qua quy trình content-signing
+# 3 vai trò riêng nếu muốn remediate thật, giống tiền lệ mở rộng Debian —
+# xem README.md "Mở rộng SCAP scan sang Debian").
+COPY ssg-ubuntu2404-ds.xml /usr/share/xml/scap/ssg/content/ssg-ubuntu2404-ds.xml
 
 WORKDIR /runner
 
@@ -74,8 +102,11 @@ COPY remediate.sh /usr/local/bin/remediate.sh
 COPY restore.sh /usr/local/bin/restore.sh
 COPY ssh-check.sh /usr/local/bin/ssh-check.sh
 COPY ca-bootstrap.sh /usr/local/bin/ca-bootstrap.sh
+COPY static-ssh-key-bootstrap.sh /usr/local/bin/static-ssh-key-bootstrap.sh
 COPY agent-install.sh /usr/local/bin/agent-install.sh
+COPY agent-uninstall.sh /usr/local/bin/agent-uninstall.sh
+COPY ssh-port-change.sh /usr/local/bin/ssh-port-change.sh
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /usr/local/bin/scan.sh /usr/local/bin/remediate.sh /usr/local/bin/restore.sh /usr/local/bin/ssh-check.sh /usr/local/bin/ca-bootstrap.sh /usr/local/bin/agent-install.sh /entrypoint.sh
+RUN chmod +x /usr/local/bin/scan.sh /usr/local/bin/remediate.sh /usr/local/bin/restore.sh /usr/local/bin/ssh-check.sh /usr/local/bin/ca-bootstrap.sh /usr/local/bin/static-ssh-key-bootstrap.sh /usr/local/bin/agent-install.sh /usr/local/bin/agent-uninstall.sh /usr/local/bin/ssh-port-change.sh /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

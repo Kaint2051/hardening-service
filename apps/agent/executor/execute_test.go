@@ -535,3 +535,74 @@ func TestExecuteRemediation_MissingPlaybookYmlInBundle(t *testing.T) {
 		t.Fatalf("thiếu Reason giải thích lý do")
 	}
 }
+
+// ---------------- executeRestore ----------------
+
+func TestExecuteRestore_InvalidBase64ReturnsNotExecuted(t *testing.T) {
+	cfg := executorConfig{remediationTimeout: 5 * time.Second}
+	result := executeRestore(cfg, jobEnvelope{Kind: "restore", BackupTarB64: "không-phải-base64!!!"})
+
+	if result.Executed {
+		t.Fatalf("Executed = true, muốn false — backup_tar_b64 không decode được")
+	}
+	if result.Reason == "" {
+		t.Fatalf("thiếu Reason giải thích lý do")
+	}
+	// Verified luôn true cho restore (không qua đường verify GPG như
+	// remediation bundle) — Executed=false là do lỗi decode, không phải bị
+	// "từ chối" như executeRemediation.
+	if !result.Verified {
+		t.Fatalf("Verified = false, muốn true (restore không qua đường verify chữ ký)")
+	}
+}
+
+func requireRestoreBinaries(t *testing.T) {
+	t.Helper()
+	for _, bin := range []string{"tar", "sshd", "systemctl"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s không có trong PATH — bỏ qua test end-to-end cần binary hệ thống thật", bin)
+		}
+	}
+}
+
+func TestExecuteRestore_ExtractsBackupAndReloadsSshd(t *testing.T) {
+	requireRestoreBinaries(t)
+
+	srcDir := t.TempDir()
+	markerPath := filepath.Join(srcDir, "restore-marker.conf")
+	if err := os.WriteFile(markerPath, []byte("restored-by-executor-test\n"), 0644); err != nil {
+		t.Fatalf("ghi file fixture thất bại: %v", err)
+	}
+
+	// tar czf - <srcDir đã đổi tên tương đối> để giải nén ra đúng path tuyệt
+	// đối srcDir khi restore chạy `tar xzf - -C /` — dùng -C srcDir/.. +
+	// tên thư mục để archive chứa ĐÚNG path tuyệt đối srcDir (giống cách
+	// remediate.sh/captureBackup tar các path tuyệt đối thật).
+	cmd := exec.Command("tar", "czf", "-", "-C", "/", strings.TrimPrefix(srcDir, "/"))
+	var tarOut bytes.Buffer
+	cmd.Stdout = &tarOut
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("chuẩn bị backup fixture (tar czf) thất bại: %v", err)
+	}
+	backupB64 := base64.StdEncoding.EncodeToString(tarOut.Bytes())
+
+	// Xoá file gốc để xác nhận executeRestore THẬT SỰ giải nén lại (không
+	// phải file cũ còn sót).
+	if err := os.Remove(markerPath); err != nil {
+		t.Fatalf("xoá file fixture trước restore thất bại: %v", err)
+	}
+
+	cfg := executorConfig{remediationTimeout: 30 * time.Second}
+	result := executeRestore(cfg, jobEnvelope{Kind: "restore", BackupTarB64: backupB64})
+
+	if !result.Executed {
+		t.Fatalf("Executed = false, muốn true — Reason=%q LogTail=%q", result.Reason, result.LogTail)
+	}
+	got, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("file fixture chưa được giải nén lại sau restore: %v", err)
+	}
+	if string(got) != "restored-by-executor-test\n" {
+		t.Fatalf("nội dung sau restore = %q, không khớp backup đã chụp", got)
+	}
+}

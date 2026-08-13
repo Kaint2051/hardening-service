@@ -142,7 +142,7 @@ func TestHeartbeat_SuccessOnNoContent(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	if err := heartbeat(upstream.Client(), upstream.URL, "h1"); err != nil {
+	if err := heartbeat(upstream.Client(), upstream.URL, "h1", "", ""); err != nil {
 		t.Fatalf("heartbeat() lỗi: %v", err)
 	}
 }
@@ -154,8 +154,94 @@ func TestHeartbeat_NonNoContentIsError(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	if err := heartbeat(upstream.Client(), upstream.URL, "h1"); err == nil {
+	if err := heartbeat(upstream.Client(), upstream.URL, "h1", "", ""); err == nil {
 		t.Fatalf("heartbeat() không lỗi dù Agent Manager trả 404")
+	}
+}
+
+func TestHeartbeat_IncludesOSFieldsWhenDetected(t *testing.T) {
+	var gotBody map[string]string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	if err := heartbeat(upstream.Client(), upstream.URL, "h1", "Ubuntu", "22.04"); err != nil {
+		t.Fatalf("heartbeat() lỗi: %v", err)
+	}
+	if gotBody["os_family"] != "Ubuntu" || gotBody["os_version"] != "22.04" {
+		t.Fatalf("body heartbeat = %+v, muốn os_family=Ubuntu os_version=22.04", gotBody)
+	}
+}
+
+// TestHeartbeat_OmitsOSFieldsWhenNotDetected xác nhận detectOS thất bại
+// (osFamily/osVersion rỗng) không gửi field rỗng lên Orchestrator — thiếu
+// HẲN key, không phải "" — vì agent_heartbeat (app/agents.py) chỉ cập nhật
+// khi field CÓ MẶT và khác rỗng; gửi "" vô hại về mặt logic backend nhưng
+// thiếu key rõ ràng hơn cho việc đọc log/debug request thật.
+func TestHeartbeat_OmitsOSFieldsWhenNotDetected(t *testing.T) {
+	var gotBody map[string]string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	if err := heartbeat(upstream.Client(), upstream.URL, "h1", "", ""); err != nil {
+		t.Fatalf("heartbeat() lỗi: %v", err)
+	}
+	if _, ok := gotBody["os_family"]; ok {
+		t.Fatalf("body heartbeat chứa os_family dù detectOS không nhận diện được: %+v", gotBody)
+	}
+	if _, ok := gotBody["os_version"]; ok {
+		t.Fatalf("body heartbeat chứa os_version dù detectOS không nhận diện được: %+v", gotBody)
+	}
+}
+
+func TestDetectOS_ParsesIDAndVersionID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "os-release")
+	os.WriteFile(path, []byte("NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID=\"22.04\"\n"), 0600)
+
+	family, version := detectOS(path)
+	if family != "Ubuntu" || version != "22.04" {
+		t.Fatalf("detectOS() = (%q, %q), muốn (Ubuntu, 22.04)", family, version)
+	}
+}
+
+func TestDetectOS_CapitalizesLowercaseID(t *testing.T) {
+	// _find_remediation_variant (app/jobs.py) so khớp os_family CASE-
+	// SENSITIVE, RemediationVariant nhập tay luôn viết hoa ("Debian") —
+	// detectOS phải khớp đúng quy ước đó dù /etc/os-release luôn ghi ID viết
+	// thường theo chuẩn systemd.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "os-release")
+	os.WriteFile(path, []byte("ID=debian\nVERSION_ID=\"12\"\n"), 0600)
+
+	family, _ := detectOS(path)
+	if family != "Debian" {
+		t.Fatalf("detectOS() family = %q, muốn Debian (viết hoa ký tự đầu)", family)
+	}
+}
+
+func TestDetectOS_MissingFileReturnsEmpty(t *testing.T) {
+	family, version := detectOS(filepath.Join(t.TempDir(), "missing-os-release"))
+	if family != "" || version != "" {
+		t.Fatalf("detectOS() cho file không tồn tại = (%q, %q), muốn (\"\", \"\")", family, version)
+	}
+}
+
+func TestDetectOS_MissingIDLineReturnsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "os-release")
+	// Có VERSION_ID nhưng thiếu ID — không đủ để xác định os_family, phải
+	// coi như không nhận diện được (không trả version mồ côi không có family).
+	os.WriteFile(path, []byte("VERSION_ID=\"22.04\"\n"), 0600)
+
+	family, version := detectOS(path)
+	if family != "" || version != "" {
+		t.Fatalf("detectOS() thiếu ID = (%q, %q), muốn (\"\", \"\")", family, version)
 	}
 }
 

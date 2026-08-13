@@ -50,12 +50,17 @@ const maxBundleResponseBytes = 64 * 1024 * 1024
 
 // claimResponse khớp response 200 của /remediate-jobs/claim (Agent Manager
 // relay tới /internal/agent/remediate-jobs/claim trên Orchestrator) — TÊN
-// FIELD JSON phải khớp tuyệt đối hợp đồng, không tự đổi.
+// FIELD JSON phải khớp tuyệt đối hợp đồng, không tự đổi. JobKind phân biệt
+// "remediate" (mặc định, control_id/remediation_ref/dry_run có ý nghĩa) và
+// "restore" (BackupTarB64 có ý nghĩa, 3 field kia rỗng/false — restore
+// không có RemediationVariant, xem app/jobs.py:_dispatch_restore_job_via_agent).
 type claimResponse struct {
 	JobID          int    `json:"job_id"`
+	JobKind        string `json:"job_kind"`
 	ControlID      string `json:"control_id"`
 	RemediationRef string `json:"remediation_ref"`
 	DryRun         bool   `json:"dry_run"`
+	BackupTarB64   string `json:"backup_tar_b64"`
 }
 
 // bundleResponse khớp response 200 của /remediation-bundle.
@@ -71,9 +76,11 @@ type bundleResponse struct {
 // executor vì đó là `package main` riêng (binary khác) — 2 struct độc lập,
 // khớp nhau bằng field JSON, không bằng kiểu Go.
 type jobEnvelope struct {
+	Kind           string `json:"kind,omitempty"`
 	ControlID      string `json:"control_id"`
 	RemediationRef string `json:"remediation_ref"`
 	DryRun         bool   `json:"dry_run"`
+	BackupTarB64   string `json:"backup_tar_b64,omitempty"`
 }
 
 // executionResult là response Executor trả về qua Unix socket — PHẢI khớp
@@ -116,6 +123,11 @@ func pollAndExecuteRemediation(client *http.Client, cfg config) {
 		// Không có job đang chờ — nhánh phổ biến nhất mỗi lần poll (đặc biệt
 		// khi active_response_enabled=false phía Orchestrator), cố ý KHÔNG
 		// log để tránh làm ồn log mỗi AGENT_REMEDIATE_POLL_INTERVAL.
+		return
+	}
+
+	if job.JobKind == "restore" {
+		pollAndExecuteRestore(client, cfg, job)
 		return
 	}
 	log.Printf("nhận remediation job job_id=%d control_id=%s remediation_ref=%s dry_run=%v", job.JobID, job.ControlID, job.RemediationRef, job.DryRun)
@@ -285,10 +297,15 @@ func executeViaExecutor(cfg config, job claimResponse) (executionResult, error) 
 		return executionResult{}, fmt.Errorf("đặt deadline cho kết nối Executor thất bại: %w", err)
 	}
 
-	envelope := jobEnvelope{
-		ControlID:      job.ControlID,
-		RemediationRef: job.RemediationRef,
-		DryRun:         job.DryRun,
+	var envelope jobEnvelope
+	if job.JobKind == "restore" {
+		envelope = jobEnvelope{Kind: "restore", BackupTarB64: job.BackupTarB64}
+	} else {
+		envelope = jobEnvelope{
+			ControlID:      job.ControlID,
+			RemediationRef: job.RemediationRef,
+			DryRun:         job.DryRun,
+		}
 	}
 	if err := json.NewEncoder(conn).Encode(envelope); err != nil {
 		return executionResult{}, fmt.Errorf("gửi job envelope tới Executor thất bại: %w", err)

@@ -1,9 +1,10 @@
 // Agent tự phát triển — Reporter (mục 4.3 architecture-proposal.md).
 //
-// Reporter chạy 5 vòng lặp độc lập song song sau khi enroll xong: heartbeat
+// Reporter chạy 6 vòng lặp độc lập song song sau khi enroll xong: heartbeat
 // (main.go), scan OpenSCAP cục bộ (scan.go), FIM hash định kỳ (fim.go), renew
-// cert mTLS (main.go), và poll/thực thi remediation job qua Executor —
-// tính năng Active Response (remediate.go). Executor (quyền cao hơn, nhận
+// cert mTLS (main.go), poll/thực thi remediation job qua Executor — tính
+// năng Active Response (remediate.go), và báo số liệu tài nguyên CPU/RAM/
+// Disk/Network mỗi ~3 phút (metrics.go). Executor (quyền cao hơn, nhận
 // job qua Unix socket) là 1 BINARY RIÊNG (./executor/), không lẫn vào tiến
 // trình Reporter (quyền tối thiểu) đang chạy đây.
 //
@@ -36,12 +37,26 @@ type config struct {
 	hostname       string
 	stateDir       string
 	heartbeatEvery time.Duration
+	osReleasePath  string
+	// osFamily/osVersion: đọc 1 LẦN lúc khởi động (main(), qua detectOS) —
+	// OS không đổi trong đời process, không cần đọc lại mỗi lần heartbeat.
+	// Rỗng nghĩa là không tự nhận diện được (file thiếu/hỏng) — heartbeat()
+	// bỏ qua field này thay vì gửi chuỗi rỗng (xem app/schemas.py:
+	// AgentHeartbeatRequest — rỗng/thiếu KHÔNG được coi là "xoá" giá trị đã
+	// biết ở Orchestrator).
+	osFamily  string
+	osVersion string
 	scanInterval   time.Duration
 	scanTimeout    time.Duration
 	scapProfile    string
 	scapDatastream string
 	fimInterval    time.Duration
 	fimPaths       []string
+	// Cadence báo metrics tài nguyên (CPU/RAM/Disk/Network) — TÁCH RIÊNG
+	// khỏi heartbeatEvery vì collectMetrics() cần ~1s sleep để lấy delta
+	// CPU/network, không muốn làm heartbeat (tín hiệu "còn sống") bị trễ
+	// theo, xem metrics.go.
+	metricsInterval time.Duration
 
 	// Active Response (Reporter <-> Agent Manager <-> Orchestrator <->
 	// Executor) — xem remediate.go. Kill-switch thật (bật/tắt tính năng) nằm
@@ -67,6 +82,7 @@ func loadConfig() config {
 		hostname:       hostname,
 		stateDir:       getenv("AGENT_STATE_DIR", "/etc/hardening-agent"),
 		heartbeatEvery: getenvDuration("AGENT_HEARTBEAT_INTERVAL", 60*time.Second),
+		osReleasePath:  getenv("AGENT_OS_RELEASE_PATH", "/etc/os-release"),
 		// Mặc định khớp entry "ubuntu2204-cis-level1-server" trong
 		// apps/orchestrator/app/jobs.py:SCAP_PROFILES — cùng 1 profile dù
 		// scan tới từ đường agentless (SSH) hay agent-based (Reporter).
@@ -80,6 +96,7 @@ func loadConfig() config {
 		scapDatastream: getenv("AGENT_SCAP_DATASTREAM", "/usr/share/xml/scap/ssg/content/ssg-ubuntu2204-ds.xml"),
 		fimInterval:    getenvDuration("AGENT_FIM_INTERVAL", 5*time.Minute),
 		fimPaths:       getenvList("AGENT_FIM_PATHS", []string{"/etc/ssh/sshd_config", "/etc/passwd", "/etc/shadow"}),
+		metricsInterval: getenvDuration("AGENT_METRICS_INTERVAL", 3*time.Minute),
 
 		remediatePollInterval: getenvDuration("AGENT_REMEDIATE_POLL_INTERVAL", 15*time.Second),
 		// Mặc định PHẢI trùng path vật lý với EXECUTOR_SIGNED_CONTENT_DIR mặc
@@ -99,6 +116,13 @@ func (c config) tokenPath() string { return filepath.Join(c.stateDir, "enroll-to
 
 func main() {
 	cfg := loadConfig()
+
+	cfg.osFamily, cfg.osVersion = detectOS(cfg.osReleasePath)
+	if cfg.osFamily == "" {
+		log.Printf("không tự nhận diện được OS từ %s — heartbeat sẽ không báo os_family/os_version (điền tay qua PATCH /hosts/{hostname} nếu cần remediate)", cfg.osReleasePath)
+	} else {
+		log.Printf("tự nhận diện OS: %s %s", cfg.osFamily, cfg.osVersion)
+	}
 
 	hadCertsBeforeStartup := fileExists(cfg.certPath()) && fileExists(cfg.keyPath())
 	if !hadCertsBeforeStartup {
@@ -131,16 +155,18 @@ func main() {
 		log.Fatalf("không dựng được mTLS client ngay sau enroll (không nên xảy ra — báo lỗi này cho dev): %v", err)
 	}
 
-	// 5 vòng lặp độc lập, mỗi cái tự quản lý lịch riêng (khoảng cách khác
+	// 6 vòng lặp độc lập, mỗi cái tự quản lý lịch riêng (khoảng cách khác
 	// nhau: heartbeat vài chục giây, scan hàng giờ, FIM vài phút, renew cert
 	// ở nửa chu kỳ hiệu lực cert — thường vài giờ, poll remediation job vài
-	// chục giây — xem remediate.go) — không có phụ thuộc lẫn nhau, 1 vòng
-	// lỗi/chậm không chặn các vòng còn lại.
+	// chục giây — xem remediate.go, báo metrics tài nguyên vài phút — xem
+	// metrics.go) — không có phụ thuộc lẫn nhau, 1 vòng lỗi/chậm không chặn
+	// các vòng còn lại.
 	go runHeartbeatLoop(client, cfg)
 	go runScanLoop(client, cfg)
 	go runFimLoop(client, cfg)
 	go runRenewalLoop(client, certs, cfg)
 	go runRemediateLoop(client, cfg)
+	go runMetricsLoop(client, cfg)
 	select {}
 }
 
@@ -167,7 +193,7 @@ func runHeartbeatLoop(client *http.Client, cfg config) {
 	log.Printf("bắt đầu vòng lặp heartbeat mỗi %s tới %s", cfg.heartbeatEvery, cfg.managerURL)
 	for {
 		runProtected("heartbeat", func() {
-			if err := heartbeat(client, cfg.managerURL, cfg.hostname); err != nil {
+			if err := heartbeat(client, cfg.managerURL, cfg.hostname, cfg.osFamily, cfg.osVersion); err != nil {
 				log.Printf("heartbeat lỗi: %v", err)
 			} else {
 				log.Printf("heartbeat OK")
@@ -242,8 +268,56 @@ func enroll(cfg config) error {
 	return nil
 }
 
-func heartbeat(client *http.Client, managerURL, hostname string) error {
-	return postAndExpect(client, managerURL+"/heartbeat", map[string]string{"hostname": hostname}, http.StatusNoContent)
+func heartbeat(client *http.Client, managerURL, hostname, osFamily, osVersion string) error {
+	payload := map[string]string{"hostname": hostname}
+	// Bỏ hẳn key thay vì gửi chuỗi rỗng — Orchestrator coi field THIẾU khác
+	// field rỗng: thiếu = "Agent không báo gì cả" (giữ nguyên giá trị cũ),
+	// còn field có mặt nhưng rỗng lẽ ra không nên xảy ra (Agent Manager relay
+	// nguyên map này, không tự bơm "" vào) nhưng vẫn tránh để chắc.
+	if osFamily != "" {
+		payload["os_family"] = osFamily
+	}
+	if osVersion != "" {
+		payload["os_version"] = osVersion
+	}
+	return postAndExpect(client, managerURL+"/heartbeat", payload, http.StatusNoContent)
+}
+
+// detectOS đọc /etc/os-release (chuẩn systemd, có trên mọi distro hiện đại)
+// để tự nhận diện OS family/version — KHÔNG bắt buộc điền tay lúc đăng ký
+// host nữa (xem app/schemas.py:HostCreate). Trả ("", "") nếu không đọc được
+// file hoặc thiếu field ID — KHÔNG fatal, os_family/os_version chỉ ảnh
+// hưởng remediate, không ảnh hưởng scan/FIM/heartbeat của Reporter.
+//
+// Viết hoa ký tự đầu ID ("ubuntu" -> "Ubuntu") để khớp ĐÚNG quy ước
+// os_family đang dùng trong RemediationVariant (nhập tay qua Control
+// Registry, luôn viết hoa "Ubuntu"/"Debian" — xem tests/test_jobs.py) —
+// _find_remediation_variant (app/jobs.py) so khớp CASE-SENSITIVE, lệch hoa
+// thường sẽ khiến remediate không tìm thấy variant dù đã khai đúng.
+func detectOS(path string) (family, version string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", ""
+	}
+
+	var id, versionID string
+	for _, line := range strings.Split(string(data), "\n") {
+		key, val, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		val = strings.Trim(val, `"`)
+		switch key {
+		case "ID":
+			id = val
+		case "VERSION_ID":
+			versionID = val
+		}
+	}
+	if id == "" {
+		return "", ""
+	}
+	return strings.ToUpper(id[:1]) + id[1:], versionID
 }
 
 // renewalRetryBackoff là khoảng chờ khi 1 lần renew thất bại (mạng lỗi, cert

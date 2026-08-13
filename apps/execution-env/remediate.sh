@@ -14,21 +14,33 @@
 #
 # Input qua biến môi trường (do job-dispatcher truyền vào lúc `docker run`,
 # xem apps/orchestrator/app/jobs.py):
-#   TARGET_HOST, SSH_USER, SSH_KEY_B64, SSH_CERT_B64 — giống scan.sh
+#   TARGET_HOST, SSH_USER, SSH_KEY_B64 — luôn có
+#   SSH_CERT_B64 — TUỲ CHỌN (thiếu nếu host dùng static SSH key — xem
+#     app/jobs.py:_get_ssh_dispatch_environment)
+#   TARGET_PORT — cổng SSH của host (Host.ssh_port, mặc định 22)
 #   REMEDIATION_REF — tên thư mục bundle trong /content/
 #   DRY_RUN — "true" (ansible-playbook --check --diff, KHÔNG đổi gì) hoặc
 #     "false" (apply thật — backup trước, xem bên dưới)
 #   CONTENT_SIGNING_TRUSTED_FINGERPRINT — fingerprint GPG tin cậy; KHÔNG đọc
 #     fingerprint tin cậy từ chính bundle đang verify, cùng nguyên tắc
 #     scripts/content-signing/verify.sh
+#   EXTRA_VARS_JSON — override RIÊNG theo host cho 1 vài biến playbook (JSON
+#     object, "{}" nếu host không override gì) — app/jobs.py đã tự lọc chỉ
+#     còn đúng biến thuộc Control.overridable_variables của Control đang
+#     chạy TRƯỚC khi truyền xuống đây (xem app/hosts.py PATCH
+#     .../variable-overrides, app/control_templates.py) — remediate.sh
+#     KHÔNG tự lọc gì thêm, chỉ truyền thẳng qua `--extra-vars` (Ansible tự
+#     ưu tiên extra-vars cao hơn vars: trong playbook).
 set -euo pipefail
 : "${TARGET_HOST:?thiếu TARGET_HOST}"
 : "${SSH_USER:?thiếu SSH_USER}"
 : "${SSH_KEY_B64:?thiếu SSH_KEY_B64}"
-: "${SSH_CERT_B64:?thiếu SSH_CERT_B64}"
+SSH_CERT_B64="${SSH_CERT_B64:-}"
+: "${TARGET_PORT:?thiếu TARGET_PORT}"
 : "${REMEDIATION_REF:?thiếu REMEDIATION_REF}"
 : "${DRY_RUN:?thiếu DRY_RUN}"
 : "${CONTENT_SIGNING_TRUSTED_FINGERPRINT:?thiếu CONTENT_SIGNING_TRUSTED_FINGERPRINT}"
+: "${EXTRA_VARS_JSON:?thiếu EXTRA_VARS_JSON}"
 
 BUNDLE_DIR="/content/${REMEDIATION_REF}"
 DATA_FILE="${BUNDLE_DIR}/content.tar.gz"
@@ -67,16 +79,25 @@ fi
 
 mkdir -p /tmp/ssh
 echo "$SSH_KEY_B64" | base64 -d > /tmp/ssh/job_key
-echo "$SSH_CERT_B64" | base64 -d > /tmp/ssh/job_key-cert.pub
 chmod 600 /tmp/ssh/job_key
-chmod 644 /tmp/ssh/job_key-cert.pub
 
-SSH_OPTS="-i /tmp/ssh/job_key -o CertificateFile=/tmp/ssh/job_key-cert.pub -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+SSH_OPTS="-i /tmp/ssh/job_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p ${TARGET_PORT}"
 # Dùng biến môi trường ansible-core hỗ trợ sẵn thay vì nhúng option vào cú
 # pháp inventory INI (dễ vỡ vì quoting) — cùng tinh thần dùng
 # SSH_ADDITIONAL_OPTIONS của scan.sh cho oscap-ssh.
 export ANSIBLE_HOST_KEY_CHECKING=False
-export ANSIBLE_SSH_COMMON_ARGS="-o CertificateFile=/tmp/ssh/job_key-cert.pub -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+ANSIBLE_SSH_COMMON_ARGS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o Port=${TARGET_PORT}"
+# 2 CHỖ RIÊNG BIỆT cùng cần CertificateFile khi có cert (SSH_OPTS ở trên —
+# dùng cho lệnh backup ssh thủ công; ANSIBLE_SSH_COMMON_ARGS — Ansible tự
+# đọc riêng, KHÔNG dùng lại SSH_OPTS) — thiếu 1 trong 2 sẽ fail âm thầm chỉ
+# ở nhánh còn thiếu.
+if [ -n "$SSH_CERT_B64" ]; then
+  echo "$SSH_CERT_B64" | base64 -d > /tmp/ssh/job_key-cert.pub
+  chmod 644 /tmp/ssh/job_key-cert.pub
+  SSH_OPTS="$SSH_OPTS -o CertificateFile=/tmp/ssh/job_key-cert.pub"
+  ANSIBLE_SSH_COMMON_ARGS="$ANSIBLE_SSH_COMMON_ARGS -o CertificateFile=/tmp/ssh/job_key-cert.pub"
+fi
+export ANSIBLE_SSH_COMMON_ARGS
 export ANSIBLE_PRIVATE_KEY_FILE="/tmp/ssh/job_key"
 export ANSIBLE_REMOTE_USER="${SSH_USER}"
 echo "${TARGET_HOST}" > /tmp/inventory
@@ -84,7 +105,7 @@ echo "${TARGET_HOST}" > /tmp/inventory
 set +e
 if [ "$DRY_RUN" = "true" ]; then
   echo "=== Dry-run (--check --diff) — KHÔNG đổi gì trên host đích ==="
-  DIFF_OUTPUT=$(ansible-playbook -i /tmp/inventory --check --diff "$PLAYBOOK" 2>&1)
+  DIFF_OUTPUT=$(ansible-playbook -i /tmp/inventory --extra-vars "$EXTRA_VARS_JSON" --check --diff "$PLAYBOOK" 2>&1)
   ANSIBLE_RC=$?
   echo "$DIFF_OUTPUT"
   echo "DIFF_OUTPUT_BEGIN"
@@ -103,7 +124,7 @@ else
   echo "BACKUP_TAR_B64_END"
 
   echo "=== Apply thật ==="
-  ansible-playbook -i /tmp/inventory "$PLAYBOOK"
+  ansible-playbook -i /tmp/inventory --extra-vars "$EXTRA_VARS_JSON" "$PLAYBOOK"
   ANSIBLE_RC=$?
 fi
 set -e

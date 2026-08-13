@@ -4,7 +4,10 @@
 #
 # Input qua biến môi trường (do job-dispatcher truyền vào lúc `docker run`,
 # xem apps/orchestrator/app/jobs.py):
-#   TARGET_HOST, SSH_USER, SSH_KEY_B64, SSH_CERT_B64 — giống scan.sh/remediate.sh
+#   TARGET_HOST, SSH_USER, SSH_KEY_B64 — luôn có
+#   SSH_CERT_B64 — TUỲ CHỌN (thiếu nếu host dùng static SSH key — xem
+#     app/jobs.py:_get_ssh_dispatch_environment)
+#   TARGET_PORT — cổng SSH của host (Host.ssh_port, mặc định 22)
 #   BACKUP_TAR_B64_CHUNKS, BACKUP_TAR_B64_0..N — nội dung tar.gz (base64) chụp
 #     bởi remediate.sh lúc apply, CHIA NHỎ thành nhiều biến (xem
 #     app/jobs.py:_chunk_backup_env) — 1 biến env duy nhất chứa toàn bộ backup
@@ -16,7 +19,8 @@ set -euo pipefail
 : "${TARGET_HOST:?thiếu TARGET_HOST}"
 : "${SSH_USER:?thiếu SSH_USER}"
 : "${SSH_KEY_B64:?thiếu SSH_KEY_B64}"
-: "${SSH_CERT_B64:?thiếu SSH_CERT_B64}"
+SSH_CERT_B64="${SSH_CERT_B64:-}"
+: "${TARGET_PORT:?thiếu TARGET_PORT}"
 : "${BACKUP_TAR_B64_CHUNKS:?thiếu BACKUP_TAR_B64_CHUNKS}"
 
 # set -u tự báo lỗi rõ ràng ("unbound variable") nếu BACKUP_TAR_B64_{i} nào
@@ -30,11 +34,13 @@ done
 
 mkdir -p /tmp/ssh
 echo "$SSH_KEY_B64" | base64 -d > /tmp/ssh/job_key
-echo "$SSH_CERT_B64" | base64 -d > /tmp/ssh/job_key-cert.pub
 chmod 600 /tmp/ssh/job_key
-chmod 644 /tmp/ssh/job_key-cert.pub
-
-SSH_OPTS="-i /tmp/ssh/job_key -o CertificateFile=/tmp/ssh/job_key-cert.pub -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+SSH_OPTS="-i /tmp/ssh/job_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p ${TARGET_PORT}"
+if [ -n "$SSH_CERT_B64" ]; then
+  echo "$SSH_CERT_B64" | base64 -d > /tmp/ssh/job_key-cert.pub
+  chmod 644 /tmp/ssh/job_key-cert.pub
+  SSH_OPTS="$SSH_OPTS -o CertificateFile=/tmp/ssh/job_key-cert.pub"
+fi
 
 echo "=== Giải nén backup lên host đích (ghi đè đúng các path đã backup lúc remediate-apply) ==="
 set +e

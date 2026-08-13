@@ -9,14 +9,25 @@ import (
 	"os/user"
 	"strconv"
 	"syscall"
+	"time"
 )
 
 type jobEnvelope struct {
+	// Kind chọn nhánh xử lý ở handleConn — "" (rỗng, mặc định) = remediate
+	// (tương thích ngược: Reporter cũ chưa biết field này vẫn gửi được job
+	// remediate như trước), "restore" = khôi phục backup cục bộ (xem
+	// execute.go:executeRestore) — KHÔNG qua đường verify GPG như remediation
+	// bundle (xem docstring executeRestore để biết vì sao vẫn an toàn tương
+	// đương đường SSH restore.sh hiện có).
+	Kind           string `json:"kind,omitempty"`
 	ControlID      string `json:"control_id"`
 	RemediationRef string `json:"remediation_ref"`
 	// DryRun chọn `ansible-playbook --check --diff` (không đổi gì trên máy,
 	// chỉ xem trước) hay apply thật — xem execute.go:executeRemediation.
 	DryRun bool `json:"dry_run"`
+	// BackupTarB64 CHỈ dùng khi Kind=="restore" — nội dung backup base64 lấy
+	// từ Job remediate-apply gốc (app/jobs.py:run_restore).
+	BackupTarB64 string `json:"backup_tar_b64,omitempty"`
 }
 
 // executionResult thay thế verifyResult trước đây — giờ còn báo cáo kết quả
@@ -120,22 +131,78 @@ func serve(cfg executorConfig) error {
 
 	log.Printf("executor lắng nghe tại %s (group=%s, 0660) — verify chữ ký RỒI thực thi ansible-playbook cục bộ (Active Response, chạy quyền root)", cfg.socketPath, cfg.socketGroup)
 
+	// acceptRetryDelay chặn Accept() spin CPU 100% trong 1 vòng log liên tục
+	// nếu lỗi accept LẶP LẠI (vd cạn file descriptor) — cùng nguyên tắc
+	// backoff-có-trần net/http tự dùng cho accept loop của chính nó. Reset về
+	// 0 ngay khi accept thành công, không cộng dồn qua các lần thành công
+	// xen giữa 2 lần lỗi không liên quan.
+	var acceptRetryDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("accept lỗi: %v", err)
+			if acceptRetryDelay == 0 {
+				acceptRetryDelay = 5 * time.Millisecond
+			} else {
+				acceptRetryDelay *= 2
+			}
+			if cap := time.Second; acceptRetryDelay > cap {
+				acceptRetryDelay = cap
+			}
+			log.Printf("accept lỗi (thử lại sau %s): %v", acceptRetryDelay, err)
+			time.Sleep(acceptRetryDelay)
 			continue
 		}
+		acceptRetryDelay = 0
 		go handleConn(conn, cfg)
 	}
 }
 
+// connIOTimeout chặn 1 kết nối treo vô thời hạn (bên gửi gửi dở dang rồi im
+// lặng, hoặc không bao giờ đọc phản hồi) chiếm goroutine mãi mãi — cộng dư
+// biên độ cho gpgVerifyTimeout + remediationTimeout (thời gian
+// executeRemediation có thể chạy thật) cùng thời gian mã hoá/giải mã JSON
+// (không đáng kể). Reporter (bên gọi) đã tự đặt deadline tương tự phía nó
+// (remediate.go:executorIOTimeout) — đây là PHÍA NGƯỢC LẠI, chạy quyền root,
+// càng cần tự bảo vệ, không phụ thuộc client cư xử đúng (Reporter là nửa lộ
+// ra mạng, giả định có thể bị chiếm quyền, theo đúng mô hình tách 2 tiến
+// trình — xem README mục tách Reporter/Executor).
+func connIOTimeout(cfg executorConfig) time.Duration {
+	return cfg.remediationTimeout + gpgVerifyTimeout + 30*time.Second
+}
+
 func handleConn(conn net.Conn, cfg executorConfig) {
 	defer conn.Close()
+	// 1 panic ở BẤT KỲ đâu trong executeRemediation (hoặc chính hàm này) sẽ
+	// crash TOÀN BỘ tiến trình Executor nếu không recover — cùng lý do
+	// Reporter có runProtected() (../main.go) cho các vòng lặp của nó, áp
+	// dụng CÀNG QUAN TRỌNG hơn ở đây: Executor chạy quyền root và xử lý
+	// NHIỀU kết nối đồng thời (mỗi kết nối 1 goroutine riêng qua serve()), 1
+	// job lỗi không được phép làm rớt các job khác đang thực thi song song.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("handleConn panic (đã recover, KHÔNG crash tiến trình): %v", r)
+		}
+	}()
+
+	if err := conn.SetDeadline(time.Now().Add(connIOTimeout(cfg))); err != nil {
+		log.Printf("đặt deadline cho kết nối thất bại: %v", err)
+		return
+	}
 
 	var env jobEnvelope
 	if err := json.NewDecoder(conn).Decode(&env); err != nil {
 		json.NewEncoder(conn).Encode(executionResult{Verified: false, Reason: "envelope không phải JSON hợp lệ"})
+		return
+	}
+
+	if env.Kind == "restore" {
+		result := executeRestore(cfg, env)
+		json.NewEncoder(conn).Encode(result)
+		if !result.Executed {
+			log.Printf("restore THẤT BẠI: %s", result.Reason)
+			return
+		}
+		log.Printf("restore thực thi xong: exit_code=%d", result.ExitCode)
 		return
 	}
 

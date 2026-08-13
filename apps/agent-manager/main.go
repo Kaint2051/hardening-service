@@ -8,8 +8,9 @@
 // trước khi agent có cert):
 //   POST /enroll      — chưa cần client cert, relay {hostname, token} sang
 //                        Orchestrator để đổi lấy cert mTLS thật.
-//   POST /heartbeat, /scan-result, /fim-event, /remediate-jobs/claim,
-//        /remediation-bundle, /remediate-result — BẮT BUỘC client cert hợp
+//   POST /heartbeat, /scan-result, /fim-event, /host-metrics,
+//        /remediate-jobs/claim, /remediation-bundle, /remediate-result,
+//        /restore-result — BẮT BUỘC client cert hợp
 //                        lệ; CN trong cert (do chính step-ca ký) phải khớp
 //                        hostname trong body, không tin hostname client tự
 //                        khai nếu không khớp cert (xem handleMTLSRelay). 3
@@ -199,6 +200,24 @@ const maxRequestBodyBytes = 1 << 20
 // fim-event/renew/remediate-jobs-claim/remediation-bundle).
 const maxRemediateResultBodyBytes = 4 << 20
 
+// defaultRelayTimeout áp dụng cho mọi route relay JSON nhỏ (heartbeat/scan-
+// result/fim-event/renew/remediate-jobs-claim/remediate-result) — đủ rộng
+// rãi cho payload cỡ này trên kết nối bình thường.
+const defaultRelayTimeout = 15 * time.Second
+
+// bundleRelayTimeout áp dụng RIÊNG cho /remediation-bundle — trước đây route
+// này dùng chung defaultRelayTimeout (15s) dù có thể mang bundle content lớn
+// hơn nhiều JSON nhỏ khác, khiến CHÍNH relay này (không phải phía Reporter
+// hay Executor) trở thành ràng buộc chặt nhất trong cả dây chuyền tải bundle
+// — chặt hơn cả timeout Reporter tự cho phép phía nó (apps/agent/pki.go:
+// buildMTLSClient, 30s cho toàn bộ vòng đời request kể cả relay qua đây),
+// dù maxBundleResponseBytes (apps/agent/remediate.go, 64 MiB) cho phép bundle
+// lớn hơn nhiều so với những gì 15s tải xong được trên kết nối không phải
+// LAN cực nhanh (phát hiện qua rà soát đối kháng riêng cho subsystem Agent).
+// Khớp đúng bằng thời gian Reporter tự cho phép — không có lý do đặt dài hơn
+// vì Reporter bỏ cuộc ở mốc đó bất kể relay này có chờ thêm hay không.
+const bundleRelayTimeout = 30 * time.Second
+
 // rateLimiter giới hạn tần suất request THEO HOSTNAME (định danh đã xác thực
 // qua CN cert — không theo IP, vì agent có thể đứng sau NAT chung IP với
 // agent khác). Dùng CHUNG 1 instance cho mọi endpoint relay (heartbeat/
@@ -304,7 +323,7 @@ func handleEnroll(orchestratorURL, secret string) http.HandlerFunc {
 			http.Error(w, `{"detail":"thiếu hostname hoặc token"}`, http.StatusBadRequest)
 			return
 		}
-		relayJSON(w, orchestratorURL+"/internal/agent/verify-and-enroll", secret, body)
+		relayJSON(w, orchestratorURL+"/internal/agent/verify-and-enroll", secret, body, defaultRelayTimeout)
 	}
 }
 
@@ -316,7 +335,18 @@ func handleEnroll(orchestratorURL, secret string) http.HandlerFunc {
 // đọc "hostname" để so khớp CN. maxBytes tham số hoá theo từng route (xem
 // maxRequestBodyBytes vs maxRemediateResultBodyBytes) — route nào mang theo
 // backup base64 cần trần cao hơn, các route JSON nhỏ khác giữ nguyên 1 MiB.
+//
+// Wrapper mỏng quanh handleMTLSRelayWithTimeout (dùng defaultRelayTimeout) —
+// giữ nguyên chữ ký cũ để KHÔNG phải sửa lại ~20 lời gọi test hiện có chỉ vì
+// 1 route (/remediation-bundle) cần timeout khác, xem đăng ký route bên dưới
+// (mux.HandleFunc) gọi thẳng handleMTLSRelayWithTimeout cho riêng route đó.
 func handleMTLSRelay(orchestratorPath, secret string, limiter *rateLimiter, maxBytes int64) http.HandlerFunc {
+	return handleMTLSRelayWithTimeout(orchestratorPath, secret, limiter, maxBytes, defaultRelayTimeout)
+}
+
+func handleMTLSRelayWithTimeout(
+	orchestratorPath, secret string, limiter *rateLimiter, maxBytes int64, timeout time.Duration,
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, `{"detail":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -366,11 +396,11 @@ func handleMTLSRelay(orchestratorPath, secret string, limiter *rateLimiter, maxB
 		// relay — Orchestrator từ nay luôn nhận đúng danh tính
 		// cryptographic, không bao giờ nhận chuỗi hostname client tự chọn.
 		body["hostname"] = cn
-		relayJSON(w, orchestratorPath, secret, body)
+		relayJSON(w, orchestratorPath, secret, body, timeout)
 	}
 }
 
-func relayJSON(w http.ResponseWriter, url, secret string, payload any) {
+func relayJSON(w http.ResponseWriter, url, secret string, payload any, timeout time.Duration) {
 	buf, err := json.Marshal(payload)
 	if err != nil {
 		http.Error(w, `{"detail":"lỗi nội bộ agent-manager"}`, http.StatusInternalServerError)
@@ -384,7 +414,7 @@ func relayJSON(w http.ResponseWriter, url, secret string, payload any) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+secret)
 
-	httpClient := &http.Client{Timeout: 15 * time.Second}
+	httpClient := &http.Client{Timeout: timeout}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		http.Error(w, `{"detail":"không gọi được Orchestrator"}`, http.StatusBadGateway)
@@ -521,7 +551,12 @@ func mustGetenv(key string) string {
 }
 
 func main() {
-	orchestratorURL := getenv("ORCHESTRATOR_URL", "http://orchestrator:8000")
+	// Cổng 8001 (KHÔNG phải 8000 — đó là cổng HTTPS browser-facing của
+	// Orchestrator, xem apps/orchestrator/app/serve.py), khớp đúng giá trị
+	// docker-compose.yml luôn set qua ORCHESTRATOR_URL — default này chỉ dùng
+	// khi biến môi trường đó bị thiếu, giữ đúng convention thay vì trỏ nhầm
+	// sang cổng browser-facing.
+	orchestratorURL := getenv("ORCHESTRATOR_URL", "http://orchestrator:8001")
 	sharedSecret := mustGetenv("AGENT_MANAGER_SHARED_SECRET")
 	listenAddr := getenv("AGENT_MANAGER_LISTEN_ADDR", ":8443")
 
@@ -554,11 +589,20 @@ func main() {
 	mux.HandleFunc("/scan-result", metricsMiddleware("scan-result", metricsStore, handleMTLSRelay(orchestratorURL+"/internal/agent/scan-result", sharedSecret, relayLimiter, maxRequestBodyBytes)))
 	mux.HandleFunc("/fim-event", metricsMiddleware("fim-event", metricsStore, handleMTLSRelay(orchestratorURL+"/internal/agent/fim-event", sharedSecret, relayLimiter, maxRequestBodyBytes)))
 	mux.HandleFunc("/renew", metricsMiddleware("renew", metricsStore, handleMTLSRelay(orchestratorURL+"/internal/agent/renew-cert", sharedSecret, relayLimiter, maxRequestBodyBytes)))
+	// "/host-metrics" (KHÔNG phải "/metrics" — route đó ở trên là Prometheus
+	// tự-giám-sát của chính agent-manager) — CPU/RAM/Disk/Network do Agent
+	// tự đo, xem apps/agent/metrics.go.
+	mux.HandleFunc("/host-metrics", metricsMiddleware("host-metrics", metricsStore, handleMTLSRelay(orchestratorURL+"/internal/agent/host-metrics", sharedSecret, relayLimiter, maxRequestBodyBytes)))
+	// "/restore-result" — job "restore" dùng CHUNG /remediate-jobs/claim bên
+	// dưới để nhận việc (job_kind trong response phân biệt), nhưng báo kết
+	// quả qua route RIÊNG này (shape khác /remediate-result — không backup
+	// mới, xem apps/agent/restore.go, app/agents.py:report_restore_result).
+	mux.HandleFunc("/restore-result", metricsMiddleware("restore-result", metricsStore, handleMTLSRelay(orchestratorURL+"/internal/agent/restore-result", sharedSecret, relayLimiter, maxRequestBodyBytes)))
 
 	// Active Response: relay generic hệt các route trên, tham số hoá maxBytes
 	// khác nhau theo nhu cầu từng route (xem comment tại maxRemediateResultBodyBytes).
 	mux.HandleFunc("/remediate-jobs/claim", metricsMiddleware("remediate-jobs-claim", metricsStore, handleMTLSRelay(orchestratorURL+"/internal/agent/remediate-jobs/claim", sharedSecret, relayLimiter, maxRequestBodyBytes)))
-	mux.HandleFunc("/remediation-bundle", metricsMiddleware("remediation-bundle", metricsStore, handleMTLSRelay(orchestratorURL+"/internal/agent/remediation-bundle", sharedSecret, relayLimiter, maxRequestBodyBytes)))
+	mux.HandleFunc("/remediation-bundle", metricsMiddleware("remediation-bundle", metricsStore, handleMTLSRelayWithTimeout(orchestratorURL+"/internal/agent/remediation-bundle", sharedSecret, relayLimiter, maxRequestBodyBytes, bundleRelayTimeout)))
 	mux.HandleFunc("/remediate-result", metricsMiddleware("remediate-result", metricsStore, handleMTLSRelay(orchestratorURL+"/internal/agent/remediate-result", sharedSecret, relayLimiter, maxRemediateResultBodyBytes)))
 
 	server := &http.Server{

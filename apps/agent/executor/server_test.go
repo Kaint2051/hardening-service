@@ -183,6 +183,25 @@ func TestServe_SocketFileIsGroupOwnedWithRestrictedPermissions(t *testing.T) {
 	}
 }
 
+func TestConnIOTimeout_CoversVerifyPlusRemediationPlusMargin(t *testing.T) {
+	// Trước đây handleConn không đặt deadline nào lên conn — 1 client dial
+	// rồi không gửi gì (Reporter compromised/lỗi, network glitch giữa chừng)
+	// khiến goroutine treo VÔ THỜI HẠN. Test bằng số học trực tiếp (nhanh,
+	// tất định) thay vì chờ thật hết deadline (connIOTimeout mặc định cỡ
+	// gpgVerifyTimeout 30s cố định + remediationTimeout, quá chậm cho unit
+	// test) — cùng mức độ (không quá) mà runProtected() phía Reporter cũng
+	// không có test ép panic thật, chỉ test qua logic tương đương.
+	cfg := executorConfig{remediationTimeout: 5 * time.Second}
+	got := connIOTimeout(cfg)
+	want := cfg.remediationTimeout + gpgVerifyTimeout + 30*time.Second
+	if got != want {
+		t.Fatalf("connIOTimeout() = %s, muốn %s (remediationTimeout + gpgVerifyTimeout + biên độ)", got, want)
+	}
+	if got <= cfg.remediationTimeout {
+		t.Fatalf("connIOTimeout() = %s phải LỚN HƠN remediationTimeout (%s) — nếu không, deadline có thể hết TRƯỚC khi executeRemediation chạy xong hợp lệ", got, cfg.remediationTimeout)
+	}
+}
+
 func TestServe_UnknownSocketGroupReturnsErrorWithoutCreatingRealSocket(t *testing.T) {
 	cfg := executorConfig{
 		socketPath:         filepath.Join(t.TempDir(), "executor.sock"),

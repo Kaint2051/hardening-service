@@ -10,16 +10,16 @@ Hai lớp phòng thủ, cả hai đều bắt buộc — thiếu 1 lớp là h�
   1. Shared secret (Bearer token, so sánh hằng thời gian).
   2. Allowlist đúng 1 image (KHÔNG nhận image tuỳ ý dù secret đúng).
 """
+import contextlib
 import hmac
 import os
+import re
 import threading
 
 import docker
 import docker.errors
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-
-app = FastAPI(title="Job Dispatcher (nội bộ — không public)")
 
 SHARED_SECRET = os.environ["JOB_DISPATCHER_SHARED_SECRET"]
 ALLOWED_IMAGE = os.environ["ALLOWED_EXECUTION_IMAGE"]
@@ -50,12 +50,74 @@ CONTENT_SIGNING_SIGNED_HOST_PATH = os.environ["CONTENT_SIGNING_SIGNED_HOST_PATH"
 _docker_client = docker.from_env()
 
 
+def _reconcile_orphaned_containers() -> None:
+    """Dọn container "job-*" còn sót lại từ lần chạy TRƯỚC của chính tiến
+    trình job-dispatcher (rủi ro lý thuyết đã ghi nhận trước đây: nếu
+    job-dispatcher bị crash/OOM-kill/restart đúng lúc giữa
+    `containers.run()` thành công và `finally: container.remove()` trong
+    `run_job` bên dưới, không còn gì trong tiến trình cũ để dọn container
+    đó nữa). Khác `app/canary.py:reconcile_orphaned_rollouts` phía
+    Orchestrator (nơi phải phân biệt "đang chạy hợp lệ" vs "mồ côi" qua
+    trạng thái DB) — job-dispatcher không giữ state nào sống lâu hơn đúng 1
+    request `/run` (mọi container nó tạo ra đều được dọn trong CÙNG request
+    đã tạo ra nó, xem `finally` bên dưới), nên BẤT KỲ container "job-*" nào
+    còn tồn tại lúc tiến trình mới vừa khởi động chắc chắn là mồ côi từ lần
+    chạy trước, không cần điều kiện phân biệt gì thêm.
+    """
+    try:
+        # KHÔNG dùng Docker filters={"name": "job-"} — filter name của Docker
+        # khớp SUBSTRING không neo đầu chuỗi (unanchored), nên "job-" cũng
+        # khớp luôn chính container "hardening-console-job-dispatcher-1" của
+        # docker-compose (chứa "job-dispatcher" ở giữa tên) — BUG THẬT tự
+        # gây ra rồi tự phát hiện qua verify E2E: reconciliation tự xoá
+        # container CỦA CHÍNH MÌNH lúc khởi động (force=True xoá cả container
+        # đang chạy), khiến job-dispatcher biến mất khỏi compose project ngay
+        # sau khi vừa lên. Liệt kê KHÔNG filter rồi tự lọc bằng Python
+        # str.startswith() — chỉ khớp đúng quy ước tên "job-{job_id}" tạo ra
+        # ở run_job() bên dưới (không có tiền tố "hardening-console-" vì
+        # containers.run() ở đó đặt tên trực tiếp, không qua compose).
+        all_containers = _docker_client.containers.list(all=True)
+    except docker.errors.DockerException as exc:
+        print(f"CANH BAO: khong the liet ke container de reconcile luc khoi dong: {exc}")
+        return
+    orphans = [c for c in all_containers if c.name.startswith("job-")]
+    for container in orphans:
+        try:
+            container.remove(force=True)
+            print(f"da don container mo coi tu lan chay truoc: {container.name}")
+        except docker.errors.DockerException as exc:
+            print(f"CANH BAO: khong the xoa container mo coi {container.name}: {exc}")
+
+
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _reconcile_orphaned_containers()
+    yield
+
+
+app = FastAPI(title="Job Dispatcher (nội bộ — không public)", lifespan=lifespan)
+
+
 class RunJobRequest(BaseModel):
     job_id: str
     image: str
     command: list[str]
     environment: dict[str, str] = {}
     timeout_seconds: int = 300
+
+
+class JobProgressOut(BaseModel):
+    pct: int
+    stage: str
+
+
+# Marker tiến độ do chính script execution-env in ra stdout (mục "progress
+# bar % thật" cho ssh-check/agent-install — xem apps/execution-env/{ssh-check,
+# agent-install}.sh). KHÔNG đổi gì ở /run hay vòng đời container — endpoint
+# /jobs/{job_id}/progress bên dưới chỉ ĐỌC THÊM log của container đang chạy
+# (container job-{job_id} vẫn tồn tại/ghi log sống trong lúc container.wait()
+# ở /run đang chặn), không cần container tự báo cáo qua kênh nào khác.
+_PROGRESS_RE = re.compile(r"^##PROGRESS## (\d{1,3}) (\S+)$")
 
 
 def _check_auth(authorization: str | None) -> None:
@@ -141,3 +203,33 @@ def run_job(body: RunJobRequest, authorization: str | None = Header(default=None
         _job_slots.release()
 
     return {"job_id": body.job_id, "exit_code": exit_code, "logs": logs}
+
+
+@app.get("/jobs/{job_id}/progress", response_model=JobProgressOut)
+def job_progress(job_id: str, authorization: str | None = Header(default=None)) -> JobProgressOut:
+    """Đọc tiến độ 1 job ĐANG CHẠY qua log hiện tại của container — KHÔNG
+    đụng gì tới /run hay vòng đời container. Chỉ dùng được trong lúc
+    container job-{job_id} còn tồn tại (container.wait() ở /run vẫn đang
+    chặn) — 404 nếu chưa tạo xong (job-dispatcher đang đợi slot trống) HOẶC
+    đã dọn xong (job kết thúc, /run's finally đã remove) — 2 case này KHÔNG
+    phân biệt được ở đây, Orchestrator tự phân biệt qua Job.status của nó.
+    """
+    _check_auth(authorization)
+    try:
+        container = _docker_client.containers.get(f"job-{job_id}")
+        logs = container.logs().decode("utf-8", errors="replace")
+    except docker.errors.NotFound:
+        raise HTTPException(
+            status_code=404, detail="container không tồn tại (chưa tạo hoặc đã dọn xong)"
+        )
+    except docker.errors.DockerException as exc:
+        raise HTTPException(status_code=502, detail=f"lỗi đọc log container: {exc}") from exc
+
+    last_match = None
+    for line in logs.splitlines():
+        m = _PROGRESS_RE.match(line.strip())
+        if m:
+            last_match = m
+    if last_match is None:
+        return JobProgressOut(pct=0, stage="starting")
+    return JobProgressOut(pct=min(int(last_match.group(1)), 100), stage=last_match.group(2))

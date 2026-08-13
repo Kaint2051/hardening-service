@@ -700,3 +700,39 @@ func TestHandleMTLSRelay_RemediateResult_StillRejectsBodyOverNewLimit(t *testing
 		t.Fatalf("status = %d, muốn 413 (body vượt giới hạn 4 MiB)", rec.Code)
 	}
 }
+
+func TestHandleMTLSRelayWithTimeout_RespectsGivenTimeout(t *testing.T) {
+	// Trước đây relayJSON hardcode 15s cho MỌI route, kể cả /remediation-
+	// bundle (có thể mang bundle content lớn hơn nhiều JSON nhỏ khác) — khiến
+	// chính relay này thành ràng buộc chặt nhất, chặt hơn cả Reporter phía
+	// gọi đã tự cho phép 30s. Test bằng timeout GIẢ nhỏ (không phải 15s/30s
+	// thật, quá chậm cho unit test) để xác nhận tham số timeout thật sự có
+	// tác dụng, không phải chỉ đổi tên biến mà giá trị vẫn hardcode ở đâu đó.
+	const upstreamDelay = 60 * time.Millisecond
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(upstreamDelay)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{}`))
+	}))
+	defer upstream.Close()
+
+	shortTimeoutHandler := handleMTLSRelayWithTimeout(
+		upstream.URL+"/internal/agent/remediation-bundle", "shhh", unlimitedLimiter(), maxRequestBodyBytes,
+		upstreamDelay/3,
+	)
+	rec := httptest.NewRecorder()
+	shortTimeoutHandler(rec, requestWithClientCN("host-A", `{"hostname":"host-A"}`))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("timeout ngắn hơn độ trễ upstream: status = %d, muốn 502 (phải bỏ cuộc đúng lúc)", rec.Code)
+	}
+
+	longTimeoutHandler := handleMTLSRelayWithTimeout(
+		upstream.URL+"/internal/agent/remediation-bundle", "shhh", unlimitedLimiter(), maxRequestBodyBytes,
+		upstreamDelay*10,
+	)
+	rec2 := httptest.NewRecorder()
+	longTimeoutHandler(rec2, requestWithClientCN("host-A", `{"hostname":"host-A"}`))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("timeout dài hơn độ trễ upstream: status = %d, muốn 200 (không được bỏ cuộc sớm)", rec2.Code)
+	}
+}

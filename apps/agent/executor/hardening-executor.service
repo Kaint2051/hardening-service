@@ -42,7 +42,17 @@ RuntimeDirectory=hardening-agent
 EnvironmentFile=/etc/hardening-agent/executor.env
 ExecStart=/opt/hardening-agent/executor/executor
 Restart=on-failure
-RestartSec=5s
+RestartSec=30s
+# StartLimitIntervalSec=0: TẮT HẲN burst-limit khởi động lại của systemd
+# (mặc định 5 lần/10s) — service này Fatal ngay khi thiếu executor.env/
+# ansible-playbook (xem provision.sh), nghĩa là thiếu cấu hình sẽ crash-loop
+# hết 5 lần trong 10s rồi systemd tự BỎ CUỘC vĩnh viễn (start-limit-hit),
+# không ai biết cho tới khi 1 remediate thật fail vì thiếu Executor (phát
+# hiện qua sự cố thật, không phải lý thuyết suông) — với RestartSec=30s ở
+# trên, service PHẢI tự thử lại vô thời hạn mỗi 30s, để chỉ cần operator bỏ
+# executor.env vào đúng chỗ là tự phục hồi, không cần biết để chạy
+# `systemctl reset-failed` tay.
+StartLimitIntervalSec=0
 
 # --- Hardening còn GIỮ được dù chạy root (không mâu thuẫn với việc ghi
 # /etc/*, reload sysctl, khởi động lại service... mà remediation cần làm) ---

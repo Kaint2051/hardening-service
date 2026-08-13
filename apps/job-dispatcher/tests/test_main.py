@@ -198,6 +198,53 @@ def test_run_releases_slot_even_when_docker_create_fails():
         assert resp.status_code == 500
 
 
+def test_startup_reconciles_orphaned_containers():
+    # Mô phỏng job-dispatcher bị crash/OOM-kill/restart đúng lúc giữa
+    # containers.run() thành công và finally: container.remove() của LẦN
+    # CHẠY TRƯỚC — container "job-*" đó còn sót lại trên Docker daemon,
+    # phải bị dọn ngay lúc tiến trình mới khởi động (xem lifespan trong
+    # app/main.py). Dùng `with TestClient(...)` (khác client module-level ở
+    # đầu file) để lifespan startup thật sự chạy.
+    orphan = MagicMock()
+    orphan.name = "job-orphaned-42"
+    main_module._docker_client.containers.list.return_value = [orphan]
+    with TestClient(main_module.app):
+        pass
+    main_module._docker_client.containers.list.assert_called_once_with(all=True)
+    orphan.remove.assert_called_once_with(force=True)
+
+
+def test_startup_reconcile_does_not_remove_job_dispatcher_own_container():
+    # Hồi quy cho BUG THẬT tự gây ra rồi tự phát hiện qua verify E2E trên lab:
+    # container docker-compose của CHÍNH job-dispatcher tên
+    # "hardening-console-job-dispatcher-1" chứa substring "job-" ở giữa (từ
+    # "job-dispatcher"), nên filter Docker filters={"name": "job-"} (unanchored,
+    # khớp substring) trước đây khớp NHẦM cả nó — reconciliation tự xoá chính
+    # container đang chạy mình lúc khởi động. Giờ lọc bằng
+    # str.startswith("job-") ở tầng Python nên KHÔNG được khớp tên này (không
+    # bắt đầu bằng "job-", bắt đầu bằng "hardening-console-").
+    own_container = MagicMock()
+    own_container.name = "hardening-console-job-dispatcher-1"
+    real_orphan = MagicMock()
+    real_orphan.name = "job-42"
+    main_module._docker_client.containers.list.return_value = [own_container, real_orphan]
+    with TestClient(main_module.app):
+        pass
+    own_container.remove.assert_not_called()
+    real_orphan.remove.assert_called_once_with(force=True)
+
+
+def test_startup_reconcile_tolerates_docker_list_failure():
+    # Lỗi liệt kê container (vd Docker daemon tạm thời không phản hồi lúc
+    # khởi động) không được chặn tiến trình khởi động — chỉ cảnh báo, không
+    # raise (không có gì bắt exception từ lifespan ở tầng uvicorn/Compose
+    # healthcheck cho job-dispatcher, raise ở đây sẽ làm cả service không
+    # bao giờ lên được, tệ hơn nhiều so với 1 vài container mồ côi).
+    main_module._docker_client.containers.list.side_effect = docker.errors.DockerException("boom")
+    with TestClient(main_module.app):
+        pass  # không raise là đủ — assert ngầm định qua việc chạy tới đây
+
+
 def test_run_removes_orphaned_container_on_create_failure():
     # docker-py .run() không atomic (create rồi start) — nếu start lỗi sau
     # khi create đã thành công, không có handle container trả về; dọn bằng
@@ -213,3 +260,51 @@ def test_run_removes_orphaned_container_on_create_failure():
     assert resp.status_code == 500
     main_module._docker_client.containers.get.assert_called_once_with("job-1")
     orphan.remove.assert_called_once_with(force=True)
+
+
+# ---- GET /jobs/{job_id}/progress (đọc log LIVE của container đang chạy —
+# xem app/main.py, tính năng progress bar % thật cho ssh-check/agent-install) ----
+
+
+def test_job_progress_missing_auth_header_401():
+    resp = client.get("/jobs/1/progress")
+    assert resp.status_code == 401
+
+
+def test_job_progress_wrong_secret_401():
+    resp = client.get("/jobs/1/progress", headers={"Authorization": "Bearer wrong-secret"})
+    assert resp.status_code == 401
+
+
+def test_job_progress_returns_last_marker_when_multiple_present():
+    container = MagicMock()
+    container.logs.return_value = (
+        b"=== Verify chu ky ===\n##PROGRESS## 5 verify_signature\n"
+        b"=== Giai nen ===\n##PROGRESS## 20 extract_bundle\n"
+    )
+    main_module._docker_client.containers.get.return_value = container
+    resp = client.get("/jobs/42/progress", headers=AUTH_HEADER)
+    assert resp.status_code == 200
+    assert resp.json() == {"pct": 20, "stage": "extract_bundle"}
+    main_module._docker_client.containers.get.assert_called_once_with("job-42")
+
+
+def test_job_progress_defaults_when_no_marker_yet():
+    container = MagicMock()
+    container.logs.return_value = b"chua co marker nao ca\n"
+    main_module._docker_client.containers.get.return_value = container
+    resp = client.get("/jobs/42/progress", headers=AUTH_HEADER)
+    assert resp.status_code == 200
+    assert resp.json() == {"pct": 0, "stage": "starting"}
+
+
+def test_job_progress_404_when_container_not_found():
+    main_module._docker_client.containers.get.side_effect = docker.errors.NotFound("khong tim thay")
+    resp = client.get("/jobs/42/progress", headers=AUTH_HEADER)
+    assert resp.status_code == 404
+
+
+def test_job_progress_502_on_other_docker_error():
+    main_module._docker_client.containers.get.side_effect = docker.errors.DockerException("boom")
+    resp = client.get("/jobs/42/progress", headers=AUTH_HEADER)
+    assert resp.status_code == 502

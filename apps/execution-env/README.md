@@ -117,6 +117,31 @@ lập ở mục A) cho từng `RemediationVariant.remediation_ref` cần dùng �
 - Pentest độc lập cho Agent trước khi bật `ACTIVE_RESPONSE_ENABLED` cho fleet
   thật (kill-switch cố tình đang tắt).
 
+## Datastream STIG cho Ubuntu 22.04 (profile `ubuntu2204-stig`)
+
+Gói apt `ssg-debderived` (0.1.65-1, cài trong `Dockerfile`) chỉ có profile
+CIS/standard cho Ubuntu — **không có profile STIG**. Đã verify thật: profile
+`stig` (DISA "Canonical Ubuntu 22.04 LTS STIG V2R7") có tồn tại trong release
+chính thức ComplianceAsCode v0.1.81 (cùng release đang dùng cho
+`control-templates/ubuntu2204-cis_level1_server.yml`), nên vendor riêng file
+`ssg-ubuntu2204-ds.xml` của release đó vào repo dưới tên
+`ssg-ubuntu2204-stig-ds.xml` (sha512 tarball đã verify trước khi lấy, xem
+`control-templates/README.md` mục quy trình chung) — **KHÔNG** thay thế/nâng
+cấp file CIS đang chạy (giữ nguyên 100% hành vi scan CIS hiện có), chỉ cộng
+thêm 1 datastream riêng, dù bản thân file này có chứa cả 2 loại profile.
+`SCAP_PROFILES["ubuntu2204-stig"]` (`app/jobs.py`) trỏ đúng
+`xccdf_org.ssgproject.content_profile_stig` của file này.
+
+Verify thật: build lại image, `oscap xccdf eval --profile
+xccdf_org.ssgproject.content_profile_stig` chạy hoàn tất (exit 0, 230
+rule-result sinh ra) — cơ chế dispatch (`scan.sh`) hoàn toàn generic
+(`SCAP_PROFILE`/`SCAP_DATASTREAM` truyền qua biến môi trường, không có
+nhánh code riêng theo profile) nên không lặp lại toàn bộ nghi lễ E2E qua SSH
+thật như lần thêm Debian — rủi ro tương đương (chỉ thêm 1 entry dữ liệu vào
+dict đã có, không đổi code dispatch). Bổ sung tab "Template" (Control
+Registry) cho cùng profile này qua `control-templates/ubuntu2204-stig.yml`
+— xem `control-templates/README.md`.
+
 ## Backup + restore trước/sau remediate
 
 `remediate.sh` (nhánh apply thật, KHÔNG áp dụng cho dry-run) tar các path cấu
