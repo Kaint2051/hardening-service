@@ -1,7 +1,7 @@
 {
   "realm": "hardening-console",
   "enabled": true,
-  "sslRequired": "none",
+  "sslRequired": "external",
   "registrationAllowed": false,
   "loginWithEmailAllowed": true,
   "bruteForceProtected": true,
@@ -42,7 +42,7 @@
       "implicitFlowEnabled": false,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
-      "redirectUris": ["http://localhost:8000/*"],
+      "redirectUris": ["https://localhost:8000/*", "https://172.30.2.111:8000/*"],
       "webOrigins": ["+"],
       "defaultClientScopes": ["profile", "email", "roles"]
     },
@@ -56,8 +56,20 @@
       "implicitFlowEnabled": false,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
-      "redirectUris": ["http://localhost:3000/*", "http://172.30.2.111:3000/*"],
-      "webOrigins": ["http://localhost:3000", "http://172.30.2.111:3000"],
+      "redirectUris": ["https://localhost:3000/*", "https://172.30.2.111:3000/*", "https://172.30.2.126:3000/*"],
+      "webOrigins": ["https://localhost:3000", "https://172.30.2.111:3000", "https://172.30.2.126:3000"],
+      "defaultClientScopes": ["profile", "email", "roles"]
+    },
+    {
+      "clientId": "orchestrator-admin",
+      "name": "Orchestrator Admin API (Keycloak service account)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
       "defaultClientScopes": ["profile", "email", "roles"]
     }
   ]

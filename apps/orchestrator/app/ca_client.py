@@ -61,7 +61,9 @@ def mint_ssh_certificate(principal: str) -> tuple[str, str]:
     return private_key, cert_pub
 
 
-def create_agent_enrollment_token(hostname: str, ttl: str = "5m") -> str:
+def create_agent_enrollment_token(
+    hostname: str, ttl: str = "5m", extra_sans: list[str] | None = None,
+) -> str:
     """Sinh 1 bootstrap token (OTT — one-time token) cho agent trên
     `hostname` dùng provisioner "agent-enrollment" (JWK, tạo sẵn từ Giai
     đoạn 0 — xem infra/step-ca/setup-provisioners.sh, dùng chung password
@@ -71,13 +73,25 @@ def create_agent_enrollment_token(hostname: str, ttl: str = "5m") -> str:
     step-ca, để không phải phụ thuộc đúng hành vi nội bộ chưa verify hết
     của step-ca cho từng loại provisioner.
 
-    Raises RuntimeError cho mọi lỗi (cùng hợp đồng với mint_ssh_certificate).
+    `extra_sans` (mục TLS Keycloak/Web/Orchestrator — cần cả DNS name nội bộ
+    LẪN IP public để browser/service nội bộ đều verify được đúng 1 cert):
+    `step ca token` chỉ đưa `hostname` vào claim "sans" NẾU không có `--san`
+    nào được truyền — hễ truyền `--san` thì PHẢI tự liệt kê lại chính
+    `hostname` vào đó nếu còn muốn nó có mặt (đã verify qua `step ca token
+    --help`, không suy đoán). `step ca certificate ... --token` sau đó tự
+    lấy đúng danh sách SAN từ token, KHÔNG nhận `--san` riêng (2 cờ đó loại
+    trừ nhau) — nên toàn bộ SAN phải quyết định ngay từ bước tạo token này.
     """
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             pw_file = os.path.join(tmpdir, "pw")
             with open(pw_file, "w", encoding="utf-8") as f:
                 f.write(settings.stepca_provisioner_password)
+
+            san_args = []
+            if extra_sans:
+                for san in [hostname, *extra_sans]:
+                    san_args += ["--san", san]
 
             result = subprocess.run(
                 [
@@ -87,6 +101,7 @@ def create_agent_enrollment_token(hostname: str, ttl: str = "5m") -> str:
                     "--not-after", ttl,
                     "--ca-url", settings.stepca_url,
                     "--root", settings.stepca_root_cert_path,
+                    *san_args,
                 ],
                 capture_output=True,
                 text=True,
@@ -138,22 +153,31 @@ def mint_agent_client_cert(hostname: str, token: str) -> tuple[str, str]:
     return cert_pem, key_pem
 
 
-def mint_agent_manager_server_cert(subject: str = "agent-manager") -> tuple[str, str]:
-    """Cấp cert x509 server cho chính Agent Manager — KHÁC với
-    mint_agent_client_cert (cert máy fleet, dùng-1-lần qua token): đây là
-    định danh dịch vụ dài hạn, Agent Manager tự gọi lại định kỳ để renew
-    trước khi hết hạn (TTL do provisioner quyết định, hiện 8h mặc định —
-    xem infra/step-ca/setup-provisioners.sh). Không cần bảng theo dõi
-    dùng-1-lần vì mọi lần gọi đều từ 1 service đáng tin (đã qua shared
-    secret) xin lại danh tính của chính nó, không phải cấp quyền mới cho
-    một bên thứ ba.
+def mint_agent_manager_server_cert(
+    subject: str = "agent-manager", extra_sans: list[str] | None = None,
+) -> tuple[str, str]:
+    """Cấp cert x509 server cho 1 service nội bộ tự renew định kỳ (Agent
+    Manager, job-dispatcher, và giờ cả Keycloak/Web/chính Orchestrator cho
+    TLS — mục "Dựng TLS thật") — KHÁC với mint_agent_client_cert (cert máy
+    fleet, dùng-1-lần qua token): đây là định danh dịch vụ dài hạn, mỗi
+    service tự gọi lại định kỳ để renew trước khi hết hạn (TTL do
+    provisioner quyết định, hiện 8h mặc định — xem
+    infra/step-ca/setup-provisioners.sh). Không cần bảng theo dõi dùng-1-lần
+    vì mọi lần gọi đều từ 1 service đáng tin (đã qua shared secret) xin lại
+    danh tính của chính nó, không phải cấp quyền mới cho một bên thứ ba.
+
+    `extra_sans`: cần cho Keycloak/Web (browser verify theo IP LAN, service
+    nội bộ khác verify theo DNS name docker network — 1 cert không đủ nếu
+    chỉ có `subject` làm SAN duy nhất, xem create_agent_enrollment_token).
+    Agent Manager/job-dispatcher không cần (không có client browser nào
+    verify theo IP) nên giữ mặc định None, không đổi hành vi cũ.
 
     Vẫn đi qua đúng 1 cửa "chỉ Orchestrator được gọi CA": tạo OTT nội bộ
     rồi đổi lấy cert ngay trong cùng lệnh gọi, không lộ OTT ra ngoài.
 
     Raises RuntimeError cho mọi lỗi (cùng hợp đồng với mint_ssh_certificate).
     """
-    token = create_agent_enrollment_token(subject, ttl="5m")
+    token = create_agent_enrollment_token(subject, ttl="5m", extra_sans=extra_sans)
     return mint_agent_client_cert(subject, token)
 
 

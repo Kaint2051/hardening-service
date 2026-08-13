@@ -29,7 +29,10 @@ khác — mọi logic nghiệp vụ nằm ở Orchestrator API).
 
 ## Biến môi trường (bake vào bundle lúc build — xem Dockerfile)
 
-`VITE_API_BASE_URL`, `VITE_KEYCLOAK_URL`, `VITE_KEYCLOAK_REALM`,
-`VITE_KEYCLOAK_CLIENT_ID` — PHẢI là địa chỉ trình duyệt gọi được (không phải
-hostname nội bộ Docker network như `orchestrator`/`keycloak`), vì code này
-chạy trong trình duyệt của người dùng, không chạy trong container.
+`VITE_KEYCLOAK_REALM`, `VITE_KEYCLOAK_CLIENT_ID` — chỉ 2 biến này còn baked
+lúc build. Mục "thống nhất 1 port": KHÔNG còn `VITE_API_BASE_URL`/
+`VITE_KEYCLOAK_URL` — `api/client.ts` gọi `/api` (relative) và
+`auth/keycloak.ts` dùng `window.location.origin`, cả 2 đều same-origin với
+chính SPA vì nginx (`nginx.conf`) reverse-proxy `/api/*` sang Orchestrator và
+`/realms/*`, `/resources/*` sang Keycloak — không cần biết trước IP/hostname
+trình duyệt dùng để truy cập nữa (trước đây phải rebuild image mỗi khi đổi IP).
